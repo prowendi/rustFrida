@@ -1094,6 +1094,7 @@ fn run_js_repl(sender: &Sender<String>) {
     let sender_clone = sender.clone();
     let config = Config::builder()
         .completion_type(CompletionType::List)
+        .completion_prompt_limit(usize::MAX)
         .build();
     let mut rl: Editor<JsReplCompleter, _> = match Editor::with_config(config) {
         Ok(e) => e,
