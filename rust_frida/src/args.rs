@@ -40,8 +40,8 @@ pub(crate) struct Args {
     #[arg(long = "connect-timeout", default_value = "30")]
     pub(crate) connect_timeout: u64,
 
-    /// 添加自定义字符串到字符串表（可多次使用）
-    /// 格式: name=value 或直接指定值
+    /// 覆盖字符串表中的指定值（可多次使用），格式: name=value
+    /// 可用名称: socket_name, hello_msg, sym_name, pthread_err, dlsym_err, proc_path, cmdline, output_path
     #[arg(short = 's', long = "string", value_name = "NAME=VALUE")]
     pub(crate) strings: Vec<String>,
 

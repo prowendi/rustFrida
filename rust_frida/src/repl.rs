@@ -11,6 +11,7 @@ use std::sync::OnceLock;
 
 use crate::communication::{complete_state, eval_state};
 use crate::log_error;
+use crate::logger::{GREEN, RED, YELLOW};
 
 /// 当前构建实际可用的命令列表（编译时由 feature 控制）
 pub(crate) fn commands() -> &'static [(&'static str, &'static str, &'static str)] {
@@ -275,6 +276,7 @@ pub(crate) fn run_js_repl(sender: &Sender<String>) {
         }
     };
     rl.set_helper(Some(JsReplCompleter::new(sender_clone)));
+    let _ = rl.load_history(".rustfrida_js_history");
 
     loop {
         match rl.readline("js> ") {
@@ -297,13 +299,13 @@ pub(crate) fn run_js_repl(sender: &Sender<String>) {
                 }
                 // 同步等待 agent 返回结果（最长 5 秒）
                 match eval_state().recv_timeout(std::time::Duration::from_secs(5)) {
-                    None => println!("\x1b[33m[timeout] 等待执行结果超时\x1b[0m"),
+                    None => println!("{YELLOW}[timeout] 等待执行结果超时{RESET}"),
                     Some(Ok(output)) => {
                         if !output.is_empty() {
-                            println!("\x1b[32m=> {}\x1b[0m", output);
+                            println!("{GREEN}=> {}{RESET}", output);
                         }
                     }
-                    Some(Err(err)) => println!("\x1b[31m[JS error] {}\x1b[0m", err),
+                    Some(Err(err)) => println!("{RED}[JS error] {}{RESET}", err),
                 }
             }
             Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
@@ -316,4 +318,5 @@ pub(crate) fn run_js_repl(sender: &Sender<String>) {
             }
         }
     }
+    let _ = rl.save_history(".rustfrida_js_history");
 }

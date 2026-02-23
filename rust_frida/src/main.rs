@@ -15,7 +15,8 @@ use communication::{
     AGENT_STAT, GLOBAL_SENDER,
 };
 use injection::{create_memfd_with_data, inject_to_process, watch_and_inject, AGENT_SO};
-use libc::{close, sleep};
+use crate::logger::{DIM, GREEN, RED, RESET, YELLOW};
+use libc::close;
 use repl::{print_help, run_js_repl, CommandCompleter};
 use rustyline::error::ReadlineError;
 use rustyline::Editor;
@@ -93,7 +94,8 @@ fn main() {
     match create_memfd_with_data("wwb_so", AGENT_SO) {
         Ok(fd) => {
             AGENT_MEMFD.store(fd, Ordering::SeqCst);
-            log_success!("已创建 agent.so memfd: {}", fd);
+            log_verbose!("已创建 agent.so memfd: {}", fd);
+            log_success!("agent.so 已就绪");
         }
         Err(e) => {
             log_error!("创建 agent.so memfd 失败: {}", e);
@@ -135,9 +137,9 @@ fn main() {
                 string_overrides.insert(name.to_string(), value.to_string());
             } else {
                 log_warn!(
-                    "未知的字符串名称 '{}', 可用名称: {:?}",
+                    "未知的字符串名称 '{}', 可用名称: {}",
                     name,
-                    available_names
+                    available_names.join(", ")
                 );
             }
         } else {
@@ -191,6 +193,7 @@ fn main() {
     {
         let deadline = std::time::Instant::now()
             + std::time::Duration::from_secs(args.connect_timeout);
+        log_info!("等待 agent 连接... (最长 {}s)", args.connect_timeout);
         while !AGENT_STAT.load(Ordering::Acquire) {
             if std::time::Instant::now() >= deadline {
                 log_error!(
@@ -201,8 +204,7 @@ fn main() {
                 log_error!("  2. logcat | grep -E 'FATAL|crash'  （agent 崩溃？）");
                 std::process::exit(1);
             }
-            unsafe { sleep(1) };
-            log_info!("等待 agent 连接...");
+            std::thread::sleep(std::time::Duration::from_millis(500));
         }
     }
     let sender = GLOBAL_SENDER.get().unwrap();
@@ -236,11 +238,11 @@ fn main() {
                                     None => log_warn!("等待脚本执行结果超时"),
                                     Some(Ok(output)) => {
                                         if !output.is_empty() {
-                                            println!("\x1b[32m=> {}\x1b[0m", output);
+                                            println!("{GREEN}=> {}{RESET}", output);
                                         }
                                     }
                                     Some(Err(err)) => {
-                                        println!("\x1b[31m[JS error] {}\x1b[0m", err)
+                                        println!("{RED}[JS error] {}{RESET}", err)
                                     }
                                 }
                             }
@@ -262,11 +264,8 @@ fn main() {
         }
     };
     rl.set_helper(Some(CommandCompleter::new()));
-    println!(
-        "  {}输入 help 查看命令，exit 退出{}",
-        crate::logger::DIM,
-        crate::logger::RESET
-    );
+    let _ = rl.load_history(".rustfrida_history");
+    println!("  {DIM}输入 help 查看命令，exit 退出{RESET}");
 
     // 发送 shutdown 到 agent 并短暂等待消息送达
     let send_shutdown = |s: &std::sync::mpsc::Sender<String>| {
@@ -277,7 +276,7 @@ fn main() {
     loop {
         // 检测 agent 是否已断连（agent 崩溃或目标进程被杀）
         if AGENT_DISCONNECTED.load(Ordering::Acquire) {
-            println!("\x1b[31m[!] Agent 连接已断开，请重新注入\x1b[0m");
+            log_error!("Agent 连接已断开，请重新注入");
             break;
         }
 
@@ -330,13 +329,13 @@ fn main() {
                 }
                 if is_eval_cmd {
                     match eval_state().recv_timeout(std::time::Duration::from_secs(5)) {
-                        None => println!("\x1b[33m[timeout] 等待执行结果超时\x1b[0m"),
+                        None => println!("{YELLOW}[timeout] 等待执行结果超时{RESET}"),
                         Some(Ok(output)) => {
                             if !output.is_empty() {
-                                println!("\x1b[32m=> {}\x1b[0m", output);
+                                println!("{GREEN}=> {}{RESET}", output);
                             }
                         }
-                        Some(Err(err)) => println!("\x1b[31m[JS error] {}\x1b[0m", err),
+                        Some(Err(err)) => println!("{RED}[JS error] {}{RESET}", err),
                     }
                 }
             }
@@ -351,6 +350,8 @@ fn main() {
             }
         }
     }
+
+    let _ = rl.save_history(".rustfrida_history");
 
     // 通知监听线程退出（防止 agent 从未连接时 join 永久阻塞）
     communication::STOP_LISTENER.store(true, Ordering::SeqCst);

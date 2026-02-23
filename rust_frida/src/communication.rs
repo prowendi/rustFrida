@@ -13,7 +13,7 @@ use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use crate::{log_agent, log_error, log_info, log_success};
+use crate::{log_agent, log_error, log_success, log_verbose};
 
 pub(crate) static AGENT_MEMFD: AtomicI32 = AtomicI32::new(-1);
 pub(crate) static STOP_LISTENER: AtomicBool = AtomicBool::new(false);
@@ -183,7 +183,7 @@ pub(crate) fn handle_socket_connection(stream: UnixStream) {
         }
 
         if trimmed == "HELLO_LOADER" {
-            log_info!("{}", trimmed);
+            log_verbose!("握手: {}", trimmed);
             let memfd = AGENT_MEMFD.load(Ordering::SeqCst);
             if memfd >= 0 {
                 if let Err(e) = send_fd_over_unix_socket(reader.get_ref(), memfd) {
