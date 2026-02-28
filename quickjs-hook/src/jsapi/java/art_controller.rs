@@ -19,9 +19,34 @@
 use crate::ffi::hook as hook_ffi;
 use crate::jsapi::console::output_message;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::art_method::{ArtBridgeFunctions, try_invalidate_jit_cache, read_entry_point};
 use super::callback::{get_replacement_method, is_replacement_method};
+
+// ============================================================================
+// wxshadow stealth 全局开关
+// ============================================================================
+
+/// 全局开关: 是否对 Java hook 的 inline patch 使用 wxshadow stealth 模式。
+/// 启用后 C 层 patch_target 优先尝试 wxshadow，失败自动 fallback 到 mprotect。
+static STEALTH_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// 设置 stealth 开关
+pub(super) fn set_stealth_enabled(enabled: bool) {
+    STEALTH_ENABLED.store(enabled, Ordering::Relaxed);
+    output_message(&format!("[wxshadow] stealth 模式: {}", if enabled { "已启用" } else { "已禁用" }));
+}
+
+/// 查询 stealth 开关状态
+pub(super) fn is_stealth_enabled() -> bool {
+    STEALTH_ENABLED.load(Ordering::Relaxed)
+}
+
+/// 返回传给 C hook 函数的 stealth 参数值 (0 或 1)
+pub(super) fn stealth_flag() -> i32 {
+    is_stealth_enabled() as i32
+}
 
 // ============================================================================
 // ArtController 状态
@@ -83,7 +108,7 @@ pub(super) fn ensure_art_controller_initialized(bridge: &ArtBridgeFunctions, ep_
                 hook_ffi::hook_install_art_router(
                     *addr as *mut std::ffi::c_void,
                     ep_offset as u32,
-                    0, // 不使用 stealth
+                    stealth_flag(),
                     env,
                 )
             };
@@ -111,7 +136,7 @@ pub(super) fn ensure_art_controller_initialized(bridge: &ArtBridgeFunctions, ep_
                     Some(on_do_call_enter),
                     None,
                     std::ptr::null_mut(),
-                    0,
+                    stealth_flag(),
                 )
             };
             if ret == 0 {
@@ -138,7 +163,7 @@ pub(super) fn ensure_art_controller_initialized(bridge: &ArtBridgeFunctions, ep_
                     None,
                     Some(on_gc_sync_leave),
                     std::ptr::null_mut(),
-                    0,
+                    stealth_flag(),
                 )
             };
             if ret == 0 {
@@ -162,7 +187,7 @@ pub(super) fn ensure_art_controller_initialized(bridge: &ArtBridgeFunctions, ep_
                     None,
                     Some(on_gc_sync_leave),
                     std::ptr::null_mut(),
-                    0,
+                    stealth_flag(),
                 )
             };
             if ret == 0 {
@@ -187,7 +212,7 @@ pub(super) fn ensure_art_controller_initialized(bridge: &ArtBridgeFunctions, ep_
                     Some(on_gc_sync_enter),
                     None,
                     std::ptr::null_mut(),
-                    0,
+                    stealth_flag(),
                 )
             };
             if ret == 0 {
@@ -213,7 +238,7 @@ pub(super) fn ensure_art_controller_initialized(bridge: &ArtBridgeFunctions, ep_
                     bridge.get_oat_quick_method_header as *mut std::ffi::c_void,
                     Some(on_get_oat_quick_method_header),
                     std::ptr::null_mut(),
-                    0,
+                    stealth_flag(),
                 )
             };
             if !trampoline.is_null() {
@@ -240,7 +265,7 @@ pub(super) fn ensure_art_controller_initialized(bridge: &ArtBridgeFunctions, ep_
                     None,
                     Some(on_gc_sync_leave),
                     std::ptr::null_mut(),
-                    0,
+                    stealth_flag(),
                 )
             };
             if ret == 0 {

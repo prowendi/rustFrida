@@ -50,6 +50,7 @@ use java_hook_api::*;
 use java_field_api::*;
 use java_method_list_api::*;
 use art_method::try_invalidate_jit_cache;
+use art_controller::{set_stealth_enabled, is_stealth_enabled};
 
 /// Add a CFunction method to a JS object.
 macro_rules! add_method {
@@ -123,6 +124,38 @@ unsafe extern "C" fn js_art_router_debug(
     JSValue::bool(true).raw()
 }
 
+/// JS CFunction: Java.setStealth(enabled) — 启用/禁用 wxshadow stealth 模式
+///
+/// 启用后所有 inline hook 优先尝试 wxshadow，内核不支持则自动 fallback 到 mprotect。
+/// 建议在首次 Java.hook() 之前调用，否则已安装的 Layer 1/2 hook 不受影响。
+unsafe extern "C" fn js_java_set_stealth(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    if argc < 1 {
+        return ffi::JS_ThrowTypeError(
+            ctx,
+            b"Java.setStealth() requires 1 argument: boolean\0".as_ptr() as *const _,
+        );
+    }
+    let arg = JSValue(*argv);
+    let enabled = arg.to_bool().unwrap_or(false);
+    set_stealth_enabled(enabled);
+    JSValue::bool(enabled).raw()
+}
+
+/// JS CFunction: Java.getStealth() — 查询 stealth 开关状态
+unsafe extern "C" fn js_java_get_stealth(
+    _ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    _argc: i32,
+    _argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    JSValue::bool(is_stealth_enabled()).raw()
+}
+
 /// Register Java API: hook/unhook (C-level) + _methods, then eval boot script
 /// to set up the Proxy-based Java.use() API.
 pub fn register_java_api(ctx: &JSContext) {
@@ -144,6 +177,8 @@ pub fn register_java_api(ctx: &JSContext) {
         add_method!(ctx.as_ptr(), java_obj, "hook", js_java_hook, 4);
         add_method!(ctx.as_ptr(), java_obj, "unhook", js_java_unhook, 3);
         add_method!(ctx.as_ptr(), java_obj, "deopt", js_java_deopt, 0);
+        add_method!(ctx.as_ptr(), java_obj, "setStealth", js_java_set_stealth, 1);
+        add_method!(ctx.as_ptr(), java_obj, "getStealth", js_java_get_stealth, 0);
         add_method!(ctx.as_ptr(), java_obj, "_artRouterDebug", js_art_router_debug, 0);
         add_method!(ctx.as_ptr(), java_obj, "_methods", js_java_methods, 1);
         add_method!(ctx.as_ptr(), java_obj, "_getFieldAuto", js_java_get_field_auto, 3);

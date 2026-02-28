@@ -382,30 +382,32 @@ int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
     int jump_result;
 
     if (stealth) {
-        /* Stealth mode: write jump to temp buffer, patch via wxshadow */
+        /* Stealth mode: write jump to temp buffer, patch via wxshadow.
+         * If wxshadow fails (kernel not supported), fall through to mprotect. */
         uint8_t jump_buf[MIN_HOOK_SIZE];
         jump_result = hook_write_jump(jump_buf, jump_dest);
         if (jump_result < 0) {
             return jump_result;
         }
-        if (wxshadow_patch(target, jump_buf, jump_result) != 0) {
-            return HOOK_ERROR_WXSHADOW_FAILED;
+        if (wxshadow_patch(target, jump_buf, jump_result) == 0) {
+            entry->stealth = 1;
+            return 0;
         }
-        entry->stealth = 1;
-    } else {
-        /* Normal mode: mprotect + direct write */
-        uintptr_t page_start = (uintptr_t)target & ~0xFFF;
-        if (mprotect((void*)page_start, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
-            return HOOK_ERROR_MPROTECT_FAILED;
-        }
-        jump_result = hook_write_jump(target, jump_dest);
-        if (jump_result < 0) {
-            restore_page_rx(page_start);
-            return jump_result;
-        }
-        entry->stealth = 0;
-        restore_page_rx(page_start);
+        hook_log("patch_target: wxshadow failed, falling back to mprotect");
     }
+
+    /* Normal mode (or wxshadow fallback): mprotect + direct write */
+    uintptr_t page_start = (uintptr_t)target & ~0xFFF;
+    if (mprotect((void*)page_start, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        return HOOK_ERROR_MPROTECT_FAILED;
+    }
+    jump_result = hook_write_jump(target, jump_dest);
+    if (jump_result < 0) {
+        restore_page_rx(page_start);
+        return jump_result;
+    }
+    entry->stealth = 0;
+    restore_page_rx(page_start);
 
     return 0;
 }

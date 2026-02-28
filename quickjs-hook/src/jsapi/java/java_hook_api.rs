@@ -24,7 +24,7 @@ use crate::jsapi::callback_util::{dup_callback_to_bytes, with_registry, with_reg
 use super::jni_core::*;
 use super::reflect::*;
 use super::art_method::*;
-use super::art_controller::ensure_art_controller_initialized;
+use super::art_controller::{ensure_art_controller_initialized, stealth_flag};
 use super::callback::*;
 
 // ============================================================================
@@ -369,7 +369,7 @@ pub(super) unsafe extern "C" fn js_java_hook(
         let trampoline = hook_ffi::hook_install_art_router(
             original_entry_point as *mut std::ffi::c_void,
             ep_offset as u32,
-            0, // 不使用 stealth
+            stealth_flag(),
             env as *mut std::ffi::c_void,
         );
 
