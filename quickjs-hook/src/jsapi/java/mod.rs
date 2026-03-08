@@ -22,7 +22,7 @@
 macro_rules! jni_fn {
     ($env:expr, $ty:ty, $idx:expr) => {
         std::mem::transmute::<*const std::ffi::c_void, $ty>(
-            $crate::jsapi::java::jni_core::jni_fn_ptr($env, $idx)
+            $crate::jsapi::java::jni_core::jni_fn_ptr($env, $idx),
         )
     };
 }
@@ -31,17 +31,17 @@ macro_rules! jni_fn {
 /// MTE 设备上 bit 48-55 可能非零，必须用 48-bit 而非 56-bit 掩码
 pub(crate) const PAC_STRIP_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 
-mod jni_core;
-mod reflect;
-mod art_method;
-mod art_thread;
 mod art_class;
 mod art_controller;
+mod art_method;
+mod art_thread;
 mod callback;
-mod java_hook_api;
 mod java_field_api;
-mod java_method_list_api;
+mod java_hook_api;
 mod java_inspect_api;
+mod java_method_list_api;
+mod jni_core;
+mod reflect;
 mod safe_mem;
 
 use crate::context::JSContext;
@@ -51,15 +51,15 @@ use crate::jsapi::console::output_message;
 use crate::jsapi::util::add_cfunction_to_object;
 use crate::value::JSValue;
 
+use art_controller::{is_stealth_enabled, set_stealth_enabled};
+use art_method::try_invalidate_jit_cache;
+use callback::*;
+use java_field_api::*;
+use java_hook_api::*;
+use java_inspect_api::*;
+use java_method_list_api::*;
 use jni_core::*;
 use reflect::*;
-use callback::*;
-use java_hook_api::*;
-use java_field_api::*;
-use java_method_list_api::*;
-use java_inspect_api::*;
-use art_method::try_invalidate_jit_cache;
-use art_controller::{set_stealth_enabled, is_stealth_enabled};
 
 /// JS CFunction: Java.deopt() — 清空 JIT 缓存 (InvalidateAllMethods)
 /// 返回 true/false 表示操作是否成功
@@ -89,7 +89,8 @@ unsafe extern "C" fn js_art_router_debug(
     let mut miss_count: u64 = 0;
     hook_ffi::hook_art_router_get_debug(&mut last_x0, &mut miss_count);
     output_message(&format!(
-        "[art_router_debug] last_x0={:#x}, miss_count={}", last_x0, miss_count
+        "[art_router_debug] last_x0={:#x}, miss_count={}",
+        last_x0, miss_count
     ));
 
     // Also dump the table for reference
@@ -154,28 +155,6 @@ unsafe extern "C" fn js_java_get_stealth(
     JSValue::bool(is_stealth_enabled()).raw()
 }
 
-/// JS CFunction: Java._beginBatch() — 进入 batch 模式，defer wxshadow release
-unsafe extern "C" fn js_begin_batch(
-    _ctx: *mut ffi::JSContext,
-    _this: ffi::JSValue,
-    _argc: i32,
-    _argv: *mut ffi::JSValue,
-) -> ffi::JSValue {
-    hook_ffi::hook_begin_batch();
-    ffi::qjs_undefined()
-}
-
-/// JS CFunction: Java._endBatch() — 结束 batch，统一 release + re-patch
-unsafe extern "C" fn js_end_batch(
-    _ctx: *mut ffi::JSContext,
-    _this: ffi::JSValue,
-    _argc: i32,
-    _argv: *mut ffi::JSValue,
-) -> ffi::JSValue {
-    hook_ffi::hook_end_batch();
-    ffi::qjs_undefined()
-}
-
 /// JS CFunction: Java._updateClassLoader(ptr) — 更新缓存的 app ClassLoader
 /// 由 Java.ready() gate hook 在 Instrumentation.newApplication 回调中调用，
 /// 传入 ClassLoader 的 jobject 指针。
@@ -188,16 +167,20 @@ unsafe extern "C" fn js_update_classloader(
     if argc < 1 {
         return ffi::JS_ThrowTypeError(
             ctx,
-            b"Java._updateClassLoader() requires 1 argument: ClassLoader jobject ptr\0".as_ptr() as *const _,
+            b"Java._updateClassLoader() requires 1 argument: ClassLoader jobject ptr\0".as_ptr()
+                as *const _,
         );
     }
     let arg = JSValue(*argv);
     let cl_ptr = match arg.to_u64(ctx) {
         Some(v) => v as *mut std::ffi::c_void,
-        None => return ffi::JS_ThrowTypeError(
-            ctx,
-            b"Java._updateClassLoader() argument must be a pointer (BigInt)\0".as_ptr() as *const _,
-        ),
+        None => {
+            return ffi::JS_ThrowTypeError(
+                ctx,
+                b"Java._updateClassLoader() argument must be a pointer (BigInt)\0".as_ptr()
+                    as *const _,
+            )
+        }
     };
 
     match ensure_jni_initialized() {
@@ -249,17 +232,51 @@ pub fn register_java_api(ctx: &JSContext) {
         add_cfunction_to_object(ctx_ptr, java_obj, "getStealth", js_java_get_stealth, 0);
         add_cfunction_to_object(ctx_ptr, java_obj, "_artRouterDebug", js_art_router_debug, 0);
         add_cfunction_to_object(ctx_ptr, java_obj, "_methods", js_java_methods, 1);
-        add_cfunction_to_object(ctx_ptr, java_obj, "_getFieldAuto", js_java_get_field_auto, 3);
+        add_cfunction_to_object(
+            ctx_ptr,
+            java_obj,
+            "_getFieldAuto",
+            js_java_get_field_auto,
+            3,
+        );
         add_cfunction_to_object(ctx_ptr, java_obj, "getField", js_java_get_field, 4);
 
         // 检测面测试 API
-        add_cfunction_to_object(ctx_ptr, java_obj, "_inspectArtMethod", js_java_inspect_art_method, 3);
-        add_cfunction_to_object(ctx_ptr, java_obj, "_setForcedInterpretOnly", js_java_set_forced_interpret_only, 1);
-        add_cfunction_to_object(ctx_ptr, java_obj, "_initArtController", js_java_init_art_controller, 0);
-        add_cfunction_to_object(ctx_ptr, java_obj, "_beginBatch", js_begin_batch, 0);
-        add_cfunction_to_object(ctx_ptr, java_obj, "_endBatch", js_end_batch, 0);
-        add_cfunction_to_object(ctx_ptr, java_obj, "_updateClassLoader", js_update_classloader, 1);
-        add_cfunction_to_object(ctx_ptr, java_obj, "_isClassLoaderReady", js_is_classloader_ready, 0);
+        add_cfunction_to_object(
+            ctx_ptr,
+            java_obj,
+            "_inspectArtMethod",
+            js_java_inspect_art_method,
+            3,
+        );
+        add_cfunction_to_object(
+            ctx_ptr,
+            java_obj,
+            "_setForcedInterpretOnly",
+            js_java_set_forced_interpret_only,
+            1,
+        );
+        add_cfunction_to_object(
+            ctx_ptr,
+            java_obj,
+            "_initArtController",
+            js_java_init_art_controller,
+            0,
+        );
+        add_cfunction_to_object(
+            ctx_ptr,
+            java_obj,
+            "_updateClassLoader",
+            js_update_classloader,
+            1,
+        );
+        add_cfunction_to_object(
+            ctx_ptr,
+            java_obj,
+            "_isClassLoaderReady",
+            js_is_classloader_ready,
+            0,
+        );
 
         // Set Java object on global
         global.set_property(ctx.as_ptr(), "Java", JSValue(java_obj));
@@ -360,7 +377,10 @@ pub fn cleanup_java_hooks() {
         for (_art_method, data) in registry {
             unsafe {
                 match &data.hook_type {
-                    callback::HookType::Replaced { replacement_addr, per_method_hook_target } => {
+                    callback::HookType::Replaced {
+                        replacement_addr,
+                        per_method_hook_target,
+                    } => {
                         // 移除 per-method 路由 hook (Layer 3, if any)
                         if let Some(target) = per_method_hook_target {
                             hook_ffi::hook_remove(*target as *mut std::ffi::c_void);

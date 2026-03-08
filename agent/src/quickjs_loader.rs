@@ -5,16 +5,19 @@
 
 #![cfg(feature = "quickjs")]
 
-use quickjs_hook::{
-    begin_bulk_cleanup, cleanup_engine, cleanup_hook_engine, cleanup_hooks, cleanup_java_hooks,
-    complete_script, get_or_init_engine, init_hook_engine, load_script, set_console_callback,
+use libc::{
+    mmap, munmap, sysconf, MAP_ANONYMOUS, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE,
+    _SC_PAGESIZE,
 };
-use libc::{mmap, munmap, PROT_READ, PROT_WRITE, PROT_EXEC, MAP_PRIVATE, MAP_ANONYMOUS, sysconf, _SC_PAGESIZE};
+use quickjs_hook::{
+    cleanup_engine, cleanup_hook_engine, cleanup_hooks, cleanup_java_hooks, complete_script,
+    get_or_init_engine, init_hook_engine, load_script, set_console_callback,
+};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
-use crate::communication::{write_stream, log_msg};
+use crate::communication::{log_msg, write_stream};
 
 static ENGINE_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
@@ -126,16 +129,19 @@ pub fn is_initialized() -> bool {
 
 /// Cleanup QuickJS resources
 pub fn cleanup() {
+    log_msg("[quickjs] cleanup start\n".to_string());
     ENGINE_INITIALIZED.store(false, Ordering::SeqCst);
-    // Bulk cleanup mode: skip per-hook wxshadow release + re-patch,
-    // wxshadow_release_all() in hook_engine_cleanup() handles them in one shot
-    begin_bulk_cleanup();
     // Unhook Java hooks first (restore ArtMethod entry points)
+    log_msg("[quickjs] cleanup_java_hooks\n".to_string());
     cleanup_java_hooks();
     // Unhook all inline hooks while the JS context (ctx) is still valid
+    log_msg("[quickjs] cleanup_hooks\n".to_string());
     cleanup_hooks();
     // Destroy JSEngine (JS_FreeContext + JS_FreeRuntime)
+    log_msg("[quickjs] cleanup_engine\n".to_string());
     cleanup_engine();
-    // Reset hook engine state (wxshadow_release_all + free pool)
+    // Reset hook engine state and free the executable pool metadata
+    log_msg("[quickjs] cleanup_hook_engine\n".to_string());
     cleanup_hook_engine();
+    log_msg("[quickjs] cleanup done\n".to_string());
 }

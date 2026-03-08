@@ -11,37 +11,37 @@ macro_rules! define_sync_cell {
     };
 }
 
-mod gumlibc;
 mod arm64_relocator;
-mod trace;
-mod exec_mem;
 mod communication;
 mod crash_handler;
+mod exec_mem;
+mod gumlibc;
+mod trace;
 
-#[cfg(feature = "frida-gum")]
-mod stalker;
 #[cfg(feature = "frida-gum")]
 mod memory_dump;
 #[cfg(feature = "qbdi")]
 mod qbdi_trace;
 #[cfg(feature = "quickjs")]
 mod quickjs_loader;
+#[cfg(feature = "frida-gum")]
+mod stalker;
 
-use crate::communication::{flush_cached_logs, log_msg, shutdown_stream, write_stream, GLOBAL_STREAM};
+use crate::communication::{
+    flush_cached_logs, log_msg, register_stream_fd, shutdown_stream, write_stream, GLOBAL_STREAM,
+};
 use crate::crash_handler::{install_crash_handlers, install_panic_hook};
-use libc::{c_int, kill, pid_t, SIGSTOP};
+use libc::{kill, pid_t, SIGSTOP};
 use std::ffi::c_void;
 use std::io::BufRead;
 use std::io::BufReader;
 use std::os::unix::io::FromRawFd;
 use std::os::unix::net::UnixStream;
-use std::ptr::null_mut;
 use std::process;
-use std::sync::OnceLock;
+use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 use std::time::Duration;
-
-pub(crate) use exec_mem::ExecMem;
 
 // hide_soinfo.c 中的调试结果函数（.init_array 构造函数填充）
 // 通过 Rust #[no_mangle] 重导出到动态符号表，供 host 端 dlsym 查询
@@ -103,8 +103,8 @@ pub static OUTPUT_PATH: OnceLock<String> = OnceLock::new();
 /// 注入参数结构体（与 rust_frida/src/types.rs 和 loader.c 完全一致）
 #[repr(C)]
 pub struct AgentArgs {
-    pub table: u64,    // *const StringTable（目标进程内地址）
-    pub ctrl_fd: i32,  // socketpair fd1（agent 端）
+    pub table: u64,       // *const StringTable（目标进程内地址）
+    pub ctrl_fd: i32,     // socketpair fd1（agent 端）
     pub agent_memfd: i32, // 目标进程内的 agent.so memfd
 }
 
@@ -112,8 +112,7 @@ pub struct AgentArgs {
 pub extern "C" fn hello_entry(args_ptr: *mut c_void) -> *mut c_void {
     // 安装Rust panic hook（需要在最前面，捕获Rust层面的panic）
     install_panic_hook();
-    // 崩溃信号处理器暂时禁用，让系统生成标准 tombstone 以便调试
-    // install_crash_handlers();
+    install_crash_handlers();
 
     // 从 AgentArgs 读取 ctrl_fd 和 StringTable 指针
     let (ctrl_fd, table) = unsafe {
@@ -142,7 +141,10 @@ pub extern "C" fn hello_entry(args_ptr: *mut c_void) -> *mut c_void {
     // 使用 ctrl_fd（socketpair 的 agent 端），已通过 socketpair 连接到 host
     let sock = unsafe { UnixStream::from_raw_fd(ctrl_fd) };
     let write_half = sock.try_clone().expect("stream clone failed");
-    GLOBAL_STREAM.set(std::sync::Mutex::new(write_half)).unwrap();
+    register_stream_fd(&write_half);
+    GLOBAL_STREAM
+        .set(std::sync::Mutex::new(write_half))
+        .unwrap();
     write_stream(b"HELLO_AGENT\n");
     std::thread::sleep(Duration::from_millis(100));
     flush_cached_logs();
@@ -200,7 +202,11 @@ fn eval_and_respond(script: &str, empty_err: &[u8]) {
 fn process_cmd(command: &str) {
     match command.split_whitespace().next() {
         Some("trace") => {
-            let tid = command.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+            let tid = command
+                .split_whitespace()
+                .nth(1)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
             std::thread::spawn(move || {
                 match trace::gum_modify_thread(tid) {
                     Ok(pid) => {
@@ -212,32 +218,42 @@ fn process_cmd(command: &str) {
                 }
                 unsafe { kill(process::id() as pid_t, SIGSTOP) }
             });
-        },
+        }
         #[cfg(feature = "frida-gum")]
         Some("stalker") => {
-            let tid = command.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+            let tid = command
+                .split_whitespace()
+                .nth(1)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
             stalker::follow(tid)
-        },
+        }
         #[cfg(feature = "frida-gum")]
         Some("hfl") => {
             let mut cmds = command.split_whitespace();
             let md = cmds.nth(1).unwrap();
-            let offset = cmds.next().and_then(|s| {
-                let s = s.strip_prefix("0x").unwrap_or(s);
-                usize::from_str_radix(s, 16).ok()
-            }).unwrap_or(0);
+            let offset = cmds
+                .next()
+                .and_then(|s| {
+                    let s = s.strip_prefix("0x").unwrap_or(s);
+                    usize::from_str_radix(s, 16).ok()
+                })
+                .unwrap_or(0);
             stalker::hfollow(md, offset)
-        },
+        }
         #[cfg(feature = "qbdi")]
         Some("qfl") => {
             let mut cmds = command.split_whitespace();
             let md = cmds.nth(1).unwrap();
-            let offset = cmds.next().and_then(|s| {
-                let s = s.strip_prefix("0x").unwrap_or(s);
-                usize::from_str_radix(s, 16).ok()
-            }).unwrap_or(0);
+            let offset = cmds
+                .next()
+                .and_then(|s| {
+                    let s = s.strip_prefix("0x").unwrap_or(s);
+                    usize::from_str_radix(s, 16).ok()
+                })
+                .unwrap_or(0);
             qbdi_trace::qfollow(md, offset)
-        },
+        }
         #[cfg(feature = "quickjs")]
         Some("jsinit") => {
             // Fix #2: 通过 EVAL:/EVAL_ERR: 协议应答，host 可用 eval_state 同步等待
@@ -245,16 +261,19 @@ fn process_cmd(command: &str) {
                 Ok(_) => write_stream(b"EVAL:initialized\n"),
                 Err(e) => write_stream(format!("EVAL_ERR:{}\n", e).as_bytes()),
             }
-        },
+        }
         #[cfg(feature = "quickjs")]
         Some("loadjs") => {
             let script = command.strip_prefix("loadjs").unwrap_or("").trim();
             eval_and_respond(script, b"EVAL_ERR:[quickjs] Error: empty script\n");
-        },
+        }
         #[cfg(feature = "quickjs")]
         Some("jseval") => {
             let expr = command.strip_prefix("jseval").unwrap_or("").trim();
-            eval_and_respond(expr, "EVAL_ERR:[quickjs] 用法: jseval <expression>\n".as_bytes());
+            eval_and_respond(
+                expr,
+                "EVAL_ERR:[quickjs] 用法: jseval <expression>\n".as_bytes(),
+            );
         }
         #[cfg(feature = "quickjs")]
         Some("jscomplete") => {
@@ -272,14 +291,14 @@ fn process_cmd(command: &str) {
                 write_stream(b"EVAL:cleaned up\n");
             }
         }
-        // shutdown — 关闭 socket 让 host 立即收到 EOF，然后清理资源
+        // shutdown — 先完整清理并输出日志，最后由 agent 主动关闭 socket
         Some("shutdown") => {
-            // 先关闭 socket，host 收到 EOF 即可退出，不必等待 agent cleanup 完成
-            shutdown_stream();
+            log_msg("收到 shutdown，开始退出清理\n".to_string());
             #[cfg(feature = "quickjs")]
             if quickjs_loader::is_initialized() {
                 quickjs_loader::cleanup();
             }
+            log_msg("退出清理完成，准备关闭 socket\n".to_string());
             SHOULD_EXIT.store(true, Ordering::Relaxed);
         }
         _ => {

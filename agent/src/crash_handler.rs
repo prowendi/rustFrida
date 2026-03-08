@@ -1,9 +1,11 @@
 //! crash/panic 处理模块 - 安装信号处理器和 panic hook
 
-use crate::communication::{log_msg, write_stream};
-use libc::{c_char, c_int, c_void, sigaction, siginfo_t, SIGABRT, SIGBUS, SIGFPE, SIGILL, SIGSEGV, SIGTRAP, SA_SIGINFO, SA_ONSTACK};
+use crate::communication::{log_msg, write_stream_raw};
+use libc::{
+    c_char, c_int, c_void, sigaction, siginfo_t, SA_ONSTACK, SA_SIGINFO, SIGABRT, SIGBUS, SIGFPE,
+    SIGILL, SIGSEGV, SIGTRAP,
+};
 use std::ffi::CStr;
-use std::io::Write;
 use std::mem::zeroed;
 use std::process;
 
@@ -42,10 +44,10 @@ extern "C" {
 /// dladdr 返回的符号信息结构体
 #[repr(C)]
 struct DlInfo {
-    dli_fname: *const c_char,  // 包含地址的共享库路径
-    dli_fbase: *mut c_void,    // 共享库的基地址
-    dli_sname: *const c_char,  // 最近符号的名称
-    dli_saddr: *mut c_void,    // 最近符号的地址
+    dli_fname: *const c_char, // 包含地址的共享库路径
+    dli_fbase: *mut c_void,   // 共享库的基地址
+    dli_sname: *const c_char, // 最近符号的名称
+    dli_saddr: *mut c_void,   // 最近符号的地址
 }
 
 extern "C" {
@@ -197,7 +199,7 @@ unsafe fn dump_registers(ucontext: *mut c_void) -> String {
     //     fault_address(8) + regs[31](248) + sp(8) + pc(8) + pstate(8)
     let uc = ucontext as *const u8;
     let mctx = 176usize; // mcontext_t offset in ucontext_t
-    let regs = uc.add(mctx + 8) as *const u64;   // regs[0..31]
+    let regs = uc.add(mctx + 8) as *const u64; // regs[0..31]
     let sp = *(uc.add(mctx + 256) as *const u64); // sp
     let pc = *(uc.add(mctx + 264) as *const u64); // pc
     let pstate = *(uc.add(mctx + 272) as *const u64); // pstate
@@ -218,11 +220,47 @@ unsafe fn dump_registers(ucontext: *mut c_void) -> String {
     for row in 0..8 {
         for col in 0..4 {
             let i = row * 4 + col;
-            if i > 30 { break; }
+            if i > 30 {
+                break;
+            }
             s.push_str(&format!("  x{:<2}=0x{:016x}", i, *regs.add(i)));
         }
         s.push('\n');
     }
+    s
+}
+
+unsafe fn extract_pc_from_ucontext(ucontext: *mut c_void) -> Option<usize> {
+    if ucontext.is_null() {
+        return None;
+    }
+    let uc = ucontext as *const u8;
+    let mctx = 176usize;
+    Some(*(uc.add(mctx + 264) as *const u64) as usize)
+}
+
+unsafe fn dump_code_bytes(addr: usize, label: &str) -> String {
+    if addr == 0 {
+        return String::new();
+    }
+
+    let start = addr.saturating_sub(32);
+    let mut s = String::new();
+    s.push_str(&format!("\n=== {} BYTES ===\n", label));
+
+    for line_start in (start..start + 64).step_by(16) {
+        s.push_str(&format!("  0x{line_start:016x}:"));
+        for i in 0..16 {
+            let cur = line_start + i;
+            let byte = *(cur as *const u8);
+            s.push_str(&format!(" {:02x}", byte));
+        }
+        if addr >= line_start && addr < line_start + 16 {
+            s.push_str("  <==");
+        }
+        s.push('\n');
+    }
+
     s
 }
 
@@ -252,7 +290,9 @@ extern "C" fn crash_signal_handler(sig: c_int, info: *mut siginfo_t, ucontext: *
              Fault Address: 0x{:x}\n\
              PID: {}\n\
              TID: {}\n",
-            sig_name, sig, fault_addr,
+            sig_name,
+            sig,
+            fault_addr,
             process::id(),
             libc::gettid()
         );
@@ -268,6 +308,9 @@ extern "C" fn crash_signal_handler(sig: c_int, info: *mut siginfo_t, ucontext: *
         crash_msg.push_str("\n=== REGISTERS ===\n");
         crash_msg.push_str(&dump_registers(ucontext));
 
+        if let Some(pc) = extract_pc_from_ucontext(ucontext) {
+            crash_msg.push_str(&dump_code_bytes(pc, "PC"));
+        }
         crash_msg.push_str("\n=== BACKTRACE ===\n");
 
         // 使用 _Unwind_Backtrace 获取调用栈
@@ -332,7 +375,7 @@ extern "C" fn crash_signal_handler(sig: c_int, info: *mut siginfo_t, ucontext: *
         crash_msg.push_str("=== END BACKTRACE ===\n\n");
 
         // 尝试通过 socket 发送
-        write_stream(crash_msg.as_bytes());
+        write_stream_raw(crash_msg.as_bytes());
 
         // 重新抛出信号以便系统处理
         libc::signal(sig, libc::SIG_DFL);
@@ -369,15 +412,22 @@ pub(crate) fn install_panic_hook() {
         let bt = Backtrace::force_capture();
 
         // 获取panic位置
-        let location = panic_info.location()
+        let location = panic_info
+            .location()
             .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
             .unwrap_or_else(|| "unknown".to_string());
 
         // 获取panic消息
-        let payload = panic_info.payload()
+        let payload = panic_info
+            .payload()
             .downcast_ref::<&str>()
             .copied()
-            .or_else(|| panic_info.payload().downcast_ref::<String>().map(|s| s.as_str()))
+            .or_else(|| {
+                panic_info
+                    .payload()
+                    .downcast_ref::<String>()
+                    .map(|s| s.as_str())
+            })
             .unwrap_or("unknown panic");
 
         let msg = format!(
@@ -387,7 +437,8 @@ pub(crate) fn install_panic_hook() {
              PID: {}, TID: {}\n\n\
              Backtrace:\n{}\n\
              =================\n\n",
-            location, payload,
+            location,
+            payload,
             process::id(),
             unsafe { libc::gettid() },
             bt

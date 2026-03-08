@@ -6,14 +6,10 @@
     var _unhook = Java.unhook;
     var _methods = Java._methods;
     var _getFieldAuto = Java._getFieldAuto;
-    var _beginBatch = Java._beginBatch;
-    var _endBatch = Java._endBatch;
     delete Java.hook;
     delete Java.unhook;
     delete Java._methods;
     delete Java._getFieldAuto;
-    delete Java._beginBatch;
-    delete Java._endBatch;
 
     // Wrap a raw Java object pointer as a Proxy for field access via dot notation.
     // e.g. ctx.thisObj.mTitle reads the mTitle field via JNI reflection.
@@ -169,11 +165,9 @@
             }
 
             if (fn === null || fn === undefined) {
-                if (sigs.length > 1) _beginBatch();
                 for (var i = 0; i < sigs.length; i++) {
                     _unhook(cls, name, sigs[i]);
                 }
-                if (sigs.length > 1) _endBatch();
                 this._fn = null;
             } else {
                 var userFn = fn;

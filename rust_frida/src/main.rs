@@ -11,19 +11,19 @@ mod selinux;
 mod spawn;
 mod types;
 
+use crate::logger::{DIM, RESET};
 use args::Args;
 use clap::Parser;
 use communication::{
     eval_state, start_socketpair_handler, AGENT_DISCONNECTED, AGENT_STAT, GLOBAL_SENDER,
 };
-use injection::{inject_to_process, inject_debug, watch_and_inject};
-use crate::logger::{DIM, RESET};
+use injection::{inject_debug, inject_to_process, watch_and_inject};
+use process::find_pid_by_name;
 use repl::{print_eval_result, print_help, run_js_repl, CommandCompleter};
 use rustyline::error::ReadlineError;
 use rustyline::Editor;
 use std::os::unix::io::RawFd;
 use std::sync::atomic::Ordering;
-use process::find_pid_by_name;
 use types::get_string_table_names;
 
 fn main() {
@@ -163,8 +163,8 @@ fn main() {
 
     // 等待 agent 连接，默认超时 30s（可通过 --connect-timeout 调整）
     {
-        let deadline = std::time::Instant::now()
-            + std::time::Duration::from_secs(args.connect_timeout);
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(args.connect_timeout);
         log_info!("等待 agent 连接... (最长 {}s)", args.connect_timeout);
         while !AGENT_STAT.load(Ordering::Acquire) {
             // Spawn 模式：Ctrl+C 触发清理退出（100ms 轮询间隔内响应）
@@ -174,10 +174,7 @@ fn main() {
                 std::process::exit(1);
             }
             if std::time::Instant::now() >= deadline {
-                log_error!(
-                    "等待 agent 连接超时 ({}s)，请检查:",
-                    args.connect_timeout
-                );
+                log_error!("等待 agent 连接超时 ({}s)，请检查:", args.connect_timeout);
                 // 检查目标进程是否仍在运行
                 if let Some(pid) = target_pid {
                     if std::path::Path::new(&format!("/proc/{}/status", pid)).exists() {
@@ -270,10 +267,13 @@ fn main() {
     let _ = rl.load_history(".rustfrida_history");
     println!("  {DIM}输入 help 查看命令，exit 退出{RESET}");
 
-    // 发送 shutdown 到 agent 并短暂等待消息送达
+    // 发送 shutdown 到 agent，随后等待 agent 完整清理并主动关闭 socket
     let send_shutdown = |s: &std::sync::mpsc::Sender<String>| {
-        let _ = s.send("shutdown".to_string());
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        if let Err(e) = s.send("shutdown".to_string()) {
+            log_error!("发送 shutdown 失败: {}", e);
+        } else {
+            log_info!("已发送 shutdown，等待 agent 主动断开连接...");
+        }
     };
 
     loop {
@@ -360,21 +360,13 @@ fn main() {
         spawn::cleanup_zygote_patches();
     }
 
-    // 等待 handler 线程退出（agent 关闭 socket 后 host 收到 EOF 自然退出）
-    // 超时保护: agent cleanup 可能因 wxshadow prctl / JNI 调用 / 锁竞争而阻塞
-    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
-    std::thread::spawn(move || {
-        let _ = handle.join();
-        let _ = done_tx.send(());
-    });
-    if done_rx.recv_timeout(std::time::Duration::from_secs(5)).is_err() {
-        log_warn!("等待 agent 退出超时 (5s)，强制退出");
-    }
+    // 等待 handler 线程退出（agent cleanup 完成后主动关闭 socket，host 收到 EOF 自然退出）
+    let _ = handle.join();
 }
 
 /// Debug 模式：监控目标进程存活状态
 fn monitor_process_alive(pid: i32, duration_secs: u64) {
-    use crate::logger::{GREEN, RED, YELLOW, BOLD, RESET, DIM};
+    use crate::logger::{BOLD, DIM, GREEN, RED, RESET, YELLOW};
 
     log_info!("监控进程 {} 存活状态 ({}s)...", pid, duration_secs);
 
@@ -388,11 +380,9 @@ fn monitor_process_alive(pid: i32, duration_secs: u64) {
         let alive = std::path::Path::new(&status_path).exists();
 
         if alive {
-            print!(" {}{:>2}s{} {}✓ alive{}",
-                DIM, sec, RESET, GREEN, RESET);
+            print!(" {}{:>2}s{} {}✓ alive{}", DIM, sec, RESET, GREEN, RESET);
         } else {
-            print!(" {}{:>2}s{} {}✗ KILLED{}",
-                DIM, sec, RESET, RED, RESET);
+            print!(" {}{:>2}s{} {}✗ KILLED{}", DIM, sec, RESET, RED, RESET);
             if death_sec.is_none() {
                 death_sec = Some(sec);
             }
@@ -418,11 +408,15 @@ fn monitor_process_alive(pid: i32, duration_secs: u64) {
 
         // 给出结论
         println!();
-        println!("  {}结论:{} 进程存活了 {}~{}s{} 后被杀",
-            BOLD, RESET, YELLOW, sec, RESET);
+        println!(
+            "  {}结论:{} 进程存活了 {}~{}s{} 后被杀",
+            BOLD, RESET, YELLOW, sec, RESET
+        );
     } else {
         log_success!("进程在 {} 秒监控期内持续存活", elapsed);
-        println!("  {}结论:{} 当前模式下进程 {}未被检测{}",
-            BOLD, RESET, GREEN, RESET);
+        println!(
+            "  {}结论:{} 当前模式下进程 {}未被检测{}",
+            BOLD, RESET, GREEN, RESET
+        );
     }
 }

@@ -78,12 +78,6 @@ typedef struct {
     pthread_mutex_t lock;           /* Thread safety lock */
     size_t exec_mem_page_size;      /* Page size for mprotect */
     int initialized;                /* Initialization flag */
-    int bulk_cleanup;               /* Skip per-hook wxshadow release during bulk cleanup */
-    /* Batch unhook: defer wxshadow release+repatch to hook_end_batch() */
-    int batch_mode;
-#define BATCH_DIRTY_PAGES_MAX 64
-    uintptr_t batch_dirty_pages[BATCH_DIRTY_PAGES_MAX];
-    int batch_dirty_count;
 } HookEngine;
 
 /*
@@ -137,26 +131,6 @@ void* hook_get_trampoline(void* target);
  * Cleanup and free all hooks
  */
 void hook_engine_cleanup(void);
-
-/*
- * Enter bulk cleanup mode: subsequent hook_remove() calls skip per-hook
- * wxshadow release + re-patch for stealth hooks.  The final
- * hook_engine_cleanup() → wxshadow_release_all() handles them in one shot.
- */
-void hook_engine_begin_bulk_cleanup(void);
-
-/*
- * Begin batch unhook mode: subsequent hook_remove() calls for stealth hooks
- * defer wxshadow release + re-patch.  Dirty pages are tracked internally.
- * Call hook_end_batch() to flush: release each dirty page once, then
- * re-patch surviving stealth hooks — O(pages + survivors) instead of O(N²).
- */
-void hook_begin_batch(void);
-
-/*
- * End batch unhook mode: release dirty pages and re-patch surviving stealth hooks.
- */
-void hook_end_batch(void);
 
 /* Internal functions - exposed for advanced use */
 

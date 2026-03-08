@@ -20,10 +20,11 @@
 
 /* wxshadow prctl operations - two-step shadow page patching:
  *   1. PATCH: create shadow + write data + activate (--x) in one step
- *   2. RELEASE: restore original mapping (for unhook)
+ *   2. RELEASE: restore the exact patch identified by its patch start address
  *
  * PATCH: prctl(op, pid, addr, buf, len) where pid=0 means current process.
- * RELEASE: prctl(op, pid, addr) where pid=0 means current process.
+ * RELEASE: prctl(op, pid, patch_addr) where patch_addr must exactly match the
+ * address passed to PATCH.
  */
 #ifndef PR_WXSHADOW_PATCH
 #define PR_WXSHADOW_PATCH   0x57580006  /* prctl(0x57580006, pid, addr, buf, len) — one-step patch */
@@ -66,13 +67,11 @@ void restore_page_rx(uintptr_t page_start);
 HookEntry* alloc_entry(void);
 void free_entry(HookEntry* entry);
 int wxshadow_patch(void* addr, const void* buf, size_t len);
-int wxshadow_release(void* addr, size_t len);
-int wxshadow_release_all(void);
+int wxshadow_release(void* addr);
 int write_jump_back(void* dst, void* target, uint32_t written_regs);
 
 /* --- Core (hook_engine.c) --- */
 HookEntry* find_hook(void* target);
-void batch_add_dirty_page(uintptr_t page);
 
 /* --- Hook installation helpers (hook_engine_mem.c) --- */
 

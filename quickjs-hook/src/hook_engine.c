@@ -65,69 +65,6 @@ HookEntry* find_hook(void* target) {
     return NULL;
 }
 
-void hook_engine_begin_bulk_cleanup(void) {
-    g_engine.bulk_cleanup = 1;
-}
-
-/* Batch unhook helpers */
-
-void batch_add_dirty_page(uintptr_t page) {
-    for (int i = 0; i < g_engine.batch_dirty_count; i++) {
-        if (g_engine.batch_dirty_pages[i] == page) return; /* dedup */
-    }
-    if (g_engine.batch_dirty_count < BATCH_DIRTY_PAGES_MAX) {
-        g_engine.batch_dirty_pages[g_engine.batch_dirty_count++] = page;
-    } else {
-        hook_log("batch_add_dirty_page: overflow, page %p dropped", (void*)page);
-    }
-}
-
-void hook_begin_batch(void) {
-    g_engine.batch_mode = 1;
-    g_engine.batch_dirty_count = 0;
-}
-
-void hook_end_batch(void) {
-    if (!g_engine.batch_mode) return;
-    g_engine.batch_mode = 0;
-
-    if (g_engine.batch_dirty_count == 0) return;
-
-    pthread_mutex_lock(&g_engine.lock);
-
-    /* Release each dirty page once */
-    for (int i = 0; i < g_engine.batch_dirty_count; i++) {
-        uintptr_t page = g_engine.batch_dirty_pages[i];
-        int ret = prctl(PR_WXSHADOW_RELEASE, 0, page, 0, 0);
-        if (ret != 0) {
-            ret = prctl(PR_WXSHADOW_RELEASE, getpid(), page, 0, 0);
-        }
-        if (ret != 0) {
-            hook_log("hook_end_batch: wxshadow_release page %p failed (errno=%d)", (void*)page, errno);
-        }
-    }
-
-    /* Re-patch surviving stealth hooks on dirty pages */
-    for (HookEntry* entry = g_engine.hooks; entry; entry = entry->next) {
-        if (!entry->stealth) continue;
-        uintptr_t entry_page = (uintptr_t)entry->target & ~0xFFFUL;
-        for (int i = 0; i < g_engine.batch_dirty_count; i++) {
-            if (g_engine.batch_dirty_pages[i] == entry_page) {
-                uint8_t jump_buf[MIN_HOOK_SIZE];
-                void* jump_dest = entry->thunk ? entry->thunk : entry->replacement;
-                int jlen = hook_write_jump(jump_buf, jump_dest);
-                if (jlen > 0) {
-                    wxshadow_patch(entry->target, jump_buf, jlen);
-                }
-                break;
-            }
-        }
-    }
-
-    g_engine.batch_dirty_count = 0;
-    pthread_mutex_unlock(&g_engine.lock);
-}
-
 /* Cleanup all hooks */
 void hook_engine_cleanup(void) {
     if (!g_engine.initialized) return;
@@ -147,17 +84,16 @@ void hook_engine_cleanup(void) {
     hook_log("hook_engine_cleanup: hooks=%d (stealth=%d), free_list=%d (stealth=%d)",
              hooks_count, stealth_hooks, free_count, stealth_free);
 
-    /* Release all wxshadow pages at once (addr=0 → teardown all shadows in this mm).
-     * This is the ONLY way to remove stealth hooks — the shadow page is a
-     * kernel-level instruction-view overlay; mprotect+memcpy writes to the
-     * data view and cannot affect the shadow. */
-    int wx_ret = wxshadow_release_all();
-    hook_log("hook_engine_cleanup: wxshadow_release_all returned %d", wx_ret);
-
-    /* Restore non-stealth hooks by writing back original bytes. */
+    /* Restore each live hook individually. Stealth hooks must be released
+     * using the exact patch start address passed during PATCH. */
     HookEntry* entry = g_engine.hooks;
     while (entry) {
-        if (!entry->stealth) {
+        if (entry->stealth) {
+            int rc = wxshadow_release(entry->target);
+            if (rc != 0) {
+                hook_log("hook_engine_cleanup: wxshadow_release failed for %p", entry->target);
+            }
+        } else {
             uintptr_t page_start = (uintptr_t)entry->target & ~0xFFF;
             mprotect((void*)page_start, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC);
             memcpy(entry->target, entry->original_bytes, entry->original_size);
@@ -183,9 +119,6 @@ void hook_engine_cleanup(void) {
     g_engine.free_list = NULL;
     g_engine.redirects = NULL;
     g_engine.exec_mem_used = 0;
-    g_engine.bulk_cleanup = 0;
-    g_engine.batch_mode = 0;
-    g_engine.batch_dirty_count = 0;
     g_engine.initialized = 0;
 
     pthread_mutex_unlock(&g_engine.lock);
