@@ -24,10 +24,12 @@ fn main() {
 
     // Compile QuickJS sources
     let quickjs_src = PathBuf::from(&manifest_dir).join("quickjs-src");
-    if quickjs_src.exists() {
+    let quickjs_c = quickjs_src.join("quickjs.c");
+    let quickjs_h = quickjs_src.join("quickjs.h");
+    if quickjs_c.exists() && quickjs_h.exists() {
         let mut build = cc::Build::new();
         build
-            .file(quickjs_src.join("quickjs.c"))
+            .file(&quickjs_c)
             .file(quickjs_src.join("libregexp.c"))
             .file(quickjs_src.join("libunicode.c"))
             .file(quickjs_src.join("cutils.c"))
@@ -90,10 +92,11 @@ fn main() {
         .expect("Failed to write placeholder bindings");
 
         println!(
-            "cargo:warning=QuickJS source not found at {:?}",
+            "cargo:warning=QuickJS source not initialized at {:?}",
             quickjs_src
         );
-        println!("cargo:warning=Run: cd quickjs-hook && ./setup_quickjs.sh");
+        println!("cargo:warning=Run: git submodule update --init --recursive quickjs-hook/quickjs-src");
+        println!("cargo:warning=Or run: cd quickjs-hook && ./setup_quickjs.sh");
     }
 
     // Generate bindings for hook_engine (includes arm64_writer and arm64_relocator)
