@@ -3,10 +3,6 @@
 本文档只说明 `rust_frida` 里可直接使用的 JavaScript API。当前实现面向 `Android + ARM64`，JS 运行时为内嵌 `QuickJS`。
 
 ## 0. 最近更新
-
-- QBDI 已升级到 `0.12.1`
-  - 解决了 Android AArch64 注入场景下 `qbdi.newVM()` 在真实 JNI 调用路径中的崩溃问题。
-  - 已在 `com.example.crcdemo` 的 `Java_com_example_crcdemo_MainActivity_getSecretString` 路径上验证通过。
 - 仓库现在使用 `Git LFS` 管理 `qbdi/libQBDI.a`
   - 首次克隆后需要执行：
 
