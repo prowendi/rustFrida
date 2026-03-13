@@ -2,6 +2,22 @@
 
 本文档只说明 `rust_frida` 里可直接使用的 JavaScript API。当前实现面向 `Android + ARM64`，JS 运行时为内嵌 `QuickJS`。
 
+## 0. 最近更新
+
+- QBDI 已升级到 `0.12.1`
+  - 解决了 Android AArch64 注入场景下 `qbdi.newVM()` 在真实 JNI 调用路径中的崩溃问题。
+  - 已在 `com.example.crcdemo` 的 `Java_com_example_crcdemo_MainActivity_getSecretString` 路径上验证通过。
+- 仓库现在使用 `Git LFS` 管理 `qbdi/libQBDI.a`
+  - 首次克隆后需要执行：
+
+```bash
+git lfs install
+git lfs pull
+```
+
+- JS 全局对象新增 `qbdi`
+  - 用于在设备侧直接创建 QBDI VM、配置插桩范围、模拟调用、执行 `run()` 和读取寄存器返回值。
+
 ## 1. 进入 JS 环境
 
 注入成功后，在 `rust_frida` 的交互界面里可用下面几个命令：
@@ -39,6 +55,7 @@ jsrepl
 - `hook()`
 - `unhook()`
 - `callNative()`
+- `qbdi`
 - `Java`
 - `Jni`
 
@@ -119,6 +136,53 @@ jsrepl
 | `hook(target, callback, stealth?)` | `AddressLike, (ctx: NativeHookContext) => any, boolean?` | `boolean` |
 | `unhook(target)` | `AddressLike` | `boolean` |
 | `callNative(func, ...args)` | `AddressLike, up to 6 x (number \| bigint \| NativePointer)` | `number \| bigint` |
+
+#### qbdi
+
+| API | 参数类型 | 返回类型 |
+| --- | --- | --- |
+| `qbdi.newVM()` | 无 | `number` |
+| `qbdi.destroyVM(vm)` | `number` | `boolean` |
+| `qbdi.addInstrumentedModuleFromAddr(vm, addr)` | `number, AddressLike` | `boolean` |
+| `qbdi.addInstrumentedRange(vm, start, end)` | `number, AddressLike, AddressLike` | `boolean` |
+| `qbdi.removeInstrumentedRange(vm, start, end)` | `number, AddressLike, AddressLike` | `boolean` |
+| `qbdi.removeAllInstrumentedRanges(vm)` | `number` | `boolean` |
+| `qbdi.allocateVirtualStack(vm, size)` | `number, number` | `boolean` |
+| `qbdi.clearVirtualStacks(vm)` | `number` | `boolean` |
+| `qbdi.simulateCall(vm, returnAddr, ...args)` | `number, AddressLike, ...AddressLike[]` | `boolean` |
+| `qbdi.call(vm, target, ...args)` | `number, AddressLike, ...AddressLike[]` | `NativePointer \| null` |
+| `qbdi.run(vm, start, stop)` | `number, AddressLike, AddressLike` | `boolean` |
+| `qbdi.getGPR(vm, reg)` | `number, number` | `NativePointer` |
+| `qbdi.setGPR(vm, reg, value)` | `number, number, AddressLike` | `boolean` |
+| `qbdi.getErrno(vm)` | `number` | `number` |
+| `qbdi.setErrno(vm, value)` | `number, number` | `boolean` |
+| `qbdi.recordMemoryAccess(vm, accessType)` | `number, number` | `boolean` |
+| `qbdi.registerTraceCallbacks(vm, target, outputDir?)` | `number, AddressLike, string?` | `boolean` |
+| `qbdi.unregisterTraceCallbacks(vm)` | `number` | `boolean` |
+| `qbdi.lastError()` | 无 | `string` |
+| `qbdi.shutdown()` | 无 | `undefined` |
+
+补充说明：
+
+- `vm` 是 `qbdi.newVM()` 返回的句柄，不是 JS 对象。
+- 常用寄存器常量包括：
+  - `qbdi.REG_RETURN`
+  - `qbdi.REG_BP`
+  - `qbdi.REG_LR`
+  - `qbdi.REG_SP`
+  - `qbdi.REG_FLAG`
+  - `qbdi.REG_PC`
+- 常见最小流程：
+
+```js
+var vm = qbdi.newVM();
+qbdi.addInstrumentedModuleFromAddr(vm, target);
+qbdi.allocateVirtualStack(vm, 0x100000);
+qbdi.simulateCall(vm, 0, arg0, arg1);
+qbdi.run(vm, target, 0);
+var ret = qbdi.getGPR(vm, qbdi.REG_RETURN);
+qbdi.destroyVM(vm);
+```
 
 #### Java
 
