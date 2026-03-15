@@ -146,14 +146,16 @@ fn collect_anon_region(target: u64) -> Option<Vec<ExecMap>> {
         return None;
     }
 
-    // 向前扩展：相邻且匿名
+    let is_valid_anon = |e: &ExecMap| is_anon_map(e) && is_readable(&e.perms);
+
+    // 向前扩展：相邻、匿名、可读
     let mut start_idx = idx;
-    while start_idx > 0 && is_anon_map(&all[start_idx - 1]) && all[start_idx - 1].end == all[start_idx].start {
+    while start_idx > 0 && is_valid_anon(&all[start_idx - 1]) && all[start_idx - 1].end == all[start_idx].start {
         start_idx -= 1;
     }
     // 向后扩展
     let mut end_idx = idx;
-    while end_idx + 1 < all.len() && is_anon_map(&all[end_idx + 1]) && all[end_idx].end == all[end_idx + 1].start {
+    while end_idx + 1 < all.len() && is_valid_anon(&all[end_idx + 1]) && all[end_idx].end == all[end_idx + 1].start {
         end_idx += 1;
     }
 
@@ -199,8 +201,15 @@ fn perms_to_u32(perms: &str) -> u32 {
     prot
 }
 
+fn is_readable(perms: &str) -> bool {
+    perms.as_bytes().first() == Some(&b'r')
+}
+
 /// dump 单个 map 条目的内存到 trace bundle
 fn dump_map_region(map: &ExecMap) {
+    if !is_readable(&map.perms) {
+        return;
+    }
     {
         let mut dumped = DUMPED_DYNAMIC_RANGES.lock().unwrap_or_else(|e| e.into_inner());
         if !dumped.insert((map.start, map.end)) {
