@@ -25,6 +25,12 @@ void* hook_install(void* target, void* replacement, int stealth) {
 
     entry->replacement = replacement;
 
+    /* stealth==2 只覆盖 4 字节 B 指令，trampoline 必须按相同 overwrite 长度回跳。
+     * 否则会在执行原函数时错误跳到 target+MIN_HOOK_SIZE，直接跳过前几条指令。 */
+    if (stealth == 2) {
+        entry->original_size = 4;
+    }
+
     if (build_trampoline(entry) < 0) {
         free_entry(entry);
         pthread_mutex_unlock(&g_engine.lock);
@@ -230,6 +236,11 @@ int hook_attach(void* target, HookCallback on_enter, HookCallback on_leave, void
     entry->on_leave = on_leave;
     entry->user_data = user_data;
 
+    /* stealth==2 只 patch 4 字节 B 指令；先固定 overwrite 大小，再生成 trampoline。 */
+    if (stealth == 2) {
+        entry->original_size = 4;
+    }
+
     if (build_trampoline(entry) < 0) {
         free_entry(entry);
         pthread_mutex_unlock(&g_engine.lock);
@@ -335,6 +346,11 @@ void* hook_replace(void* target, HookCallback on_enter, void* user_data, int ste
 
     entry->on_enter = on_enter;
     entry->user_data = user_data;
+
+    /* stealth==2 只 patch 4 字节 B 指令；先固定 overwrite 大小，再生成 trampoline。 */
+    if (stealth == 2) {
+        entry->original_size = 4;
+    }
 
     if (build_trampoline(entry) < 0) {
         free_entry(entry);

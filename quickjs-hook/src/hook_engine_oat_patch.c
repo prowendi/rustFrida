@@ -501,10 +501,26 @@ static int apply_oat_inline_patch(
      * LDR that was relocated to the trampoline), using Xscratch is safe. */
     Arm64Reg scratch_reg = (Arm64Reg)(ARM64_REG_X0 + scratch);
 
-    /* 用 hook_write_jump_at 以 patch_addr 的 PC 生成跳转（ADRP 优先）。
+    /* 确定 exec_pc：stealth2 (recomp) 代码在 recomp 页执行，ADRP 偏移必须基于 recomp 地址。
+     * stealth0/1 代码在 patch_addr 执行（wxshadow 保持虚拟地址不变）。
      * aligned(32) 防止 buf 跨页 (wxshadow copy_from_user_via_pte 限制)。 */
+    size_t page_size = g_engine.exec_mem_page_size;
+    uintptr_t page_start = patch_addr & ~(page_size - 1);
+
+    uint64_t exec_pc = patch_addr;
+    uintptr_t recomp_addr = 0;
+    if (g_stealth_mode == 2 && g_recomp_translate) {
+        recomp_addr = g_recomp_translate(patch_addr);
+        if (!recomp_addr) {
+            hook_log("\033[31m[STEALTH 失效] oat_patch recomp 翻译失败 %#lx，patch 未安装！\033[0m",
+                     (unsigned long)patch_addr);
+            return -1;
+        }
+        exec_pc = (uint64_t)recomp_addr;
+    }
+
     uint8_t redirect[MIN_HOOK_SIZE] __attribute__((aligned(32)));
-    int jump_len = hook_write_jump_at(redirect, (uint64_t)patch_addr, trampoline);
+    int jump_len = hook_write_jump_at(redirect, exec_pc, trampoline);
     if (jump_len < 0) {
         hook_log("[oat_patch] hook_write_jump failed: %d", jump_len);
         return -1;
@@ -512,22 +528,13 @@ static int apply_oat_inline_patch(
 
     int overwrite = jump_len;
 
-    /* Save original bytes */
+    /* Save original bytes (always from original address) */
     read_target_safe((void*)patch_addr, saved_original, overwrite);
     *patch_size_out = overwrite;
 
-    /* Apply patch: 严格按用户设置的 stealth 模式执行 */
-    size_t page_size = g_engine.exec_mem_page_size;
-    uintptr_t page_start = patch_addr & ~(page_size - 1);
-
-    if (g_stealth_mode == 2 && g_recomp_translate) {
-        /* Recomp 模式 */
-        uintptr_t recomp_addr = g_recomp_translate(patch_addr);
-        if (!recomp_addr) {
-            hook_log("\033[31m[STEALTH 失效] oat_patch recomp 翻译失败 %#lx，patch 未安装！\033[0m",
-                     (unsigned long)patch_addr);
-            return -1;
-        }
+    /* Apply patch */
+    if (recomp_addr) {
+        /* Recomp 模式 — exec_pc 已正确设为 recomp_addr */
         uintptr_t recomp_page = recomp_addr & ~(page_size - 1);
         mprotect((void*)recomp_page, page_size * 2, PROT_READ | PROT_WRITE | PROT_EXEC);
         memcpy((void*)recomp_addr, redirect, overwrite);

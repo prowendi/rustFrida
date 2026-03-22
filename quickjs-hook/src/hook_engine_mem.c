@@ -402,18 +402,55 @@ void* hook_mmap_near_range(void* target, size_t alloc_size, int64_t max_range) {
                 gap_start = (gap_start + page_size - 1) & ~(page_size - 1);
 
                 if (gap_end > gap_start && (gap_end - gap_start) >= alloc_size) {
-                    uintptr_t candidate;
+                    uintptr_t gap_last = (gap_end - alloc_size) & ~(page_size - 1);
+                    uintptr_t center;
+                    uintptr_t trials[8];
+                    int num_trials = 0;
+
                     if (target_addr >= gap_start && target_addr < gap_end) {
-                        candidate = target_addr & ~(page_size - 1);
-                        if (candidate < gap_start) candidate = gap_start;
+                        center = target_addr & ~(page_size - 1);
+                        if (center < gap_start) center = gap_start;
+                        if (center > gap_last) center = gap_last;
                     } else if (target_addr < gap_start) {
-                        candidate = gap_start;
+                        center = gap_start;
                     } else {
-                        candidate = (gap_end - alloc_size) & ~(page_size - 1);
-                        if (candidate < gap_start) candidate = gap_start;
+                        center = gap_last;
                     }
 
-                    if (candidate + alloc_size <= gap_end && num_candidates < MAX_CANDIDATES) {
+                    /* 同一 gap 内多点尝试：
+                     * - 起点 / 终点
+                     * - target 对齐点
+                     * - target 左右一个 alloc_size
+                     * - target 左右 16KB
+                     * 这样能避免“gap 足够大，但单个候选点刚好被占用”的情况。 */
+                    trials[num_trials++] = center;
+                    trials[num_trials++] = gap_start;
+                    trials[num_trials++] = gap_last;
+
+                    if (center >= gap_start + alloc_size)
+                        trials[num_trials++] = center - alloc_size;
+                    if (center + alloc_size <= gap_last)
+                        trials[num_trials++] = center + alloc_size;
+                    if (center >= gap_start + (uintptr_t)(page_size * 4))
+                        trials[num_trials++] = center - (uintptr_t)(page_size * 4);
+                    if (center + (uintptr_t)(page_size * 4) <= gap_last)
+                        trials[num_trials++] = center + (uintptr_t)(page_size * 4);
+
+                    for (int t = 0; t < num_trials && num_candidates < MAX_CANDIDATES; t++) {
+                        uintptr_t candidate = trials[t] & ~(page_size - 1);
+                        if (candidate < gap_start || candidate > gap_last)
+                            continue;
+
+                        int duplicate = 0;
+                        for (int k = 0; k < num_candidates; k++) {
+                            if (candidates[k].addr == candidate) {
+                                duplicate = 1;
+                                break;
+                            }
+                        }
+                        if (duplicate)
+                            continue;
+
                         int64_t d = (int64_t)(candidate - target_addr);
                         if (d < 0) d = -d;
                         candidates[num_candidates].addr = candidate;
@@ -438,7 +475,7 @@ void* hook_mmap_near_range(void* target, size_t alloc_size, int64_t max_range) {
         candidates[j + 1] = tmp;
     }
 
-    int max_tries = num_candidates < 16 ? num_candidates : 16;
+    int max_tries = num_candidates < MAX_CANDIDATES ? num_candidates : MAX_CANDIDATES;
 
     #ifndef MAP_FIXED_NOREPLACE
     #define MAP_FIXED_NOREPLACE 0x100000
@@ -451,7 +488,10 @@ void* hook_mmap_near_range(void* target, size_t alloc_size, int64_t max_range) {
                          PROT_READ | PROT_WRITE | PROT_EXEC,
                          MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
 
-        if (ptr == MAP_FAILED && (errno == ENOSYS || errno == EINVAL)) {
+        /* MAP_FIXED_NOREPLACE 要求候选地址完全可用；若该点被占用（EEXIST），
+         * 仍可退回普通 hint mmap，让内核在同一 gap 内挑一个附近可用地址。
+         * 之后再用距离校验保证结果仍在允许范围内。 */
+        if (ptr == MAP_FAILED && (errno == ENOSYS || errno == EINVAL || errno == EEXIST)) {
             ptr = mmap(cand, alloc_size,
                        PROT_READ | PROT_WRITE | PROT_EXEC,
                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -563,16 +603,18 @@ void* hook_alloc_near(size_t size, void* target) {
         }
     }
 
-    /* Phase 2: 创建 nearby pool（扫描 maps 空隙） */
-    ExecPool* near_pool = create_pool_near(target);
-    if (near_pool) {
-        void* ptr = alloc_from_pool(near_pool, size);
-        if (ptr) return ptr;
+    /* Phase 2: 优先用通用分配兜底（节省 pool slot 给 hook_alloc_near_range）。
+     * hook_alloc_near 不要求严格距离，MOVZ+MOVK 路径始终可用。
+     * 只在通用空间耗尽时才创建 nearby pool。 */
+    void* fallback = hook_alloc(size);
+    if (fallback) {
+        /* 即使不在 ADRP 范围也返回 — hook_write_jump 会用 MOVZ+MOVK 兜底 */
+        return fallback;
     }
 
-    /* Phase 3: nearby 失败 → 通用分配兜底（MOVZ+MOVK 路径） */
-    hook_log("hook_alloc_near: WARN nearby failed for target %p, fallback generic", target);
-    return hook_alloc(size);
+    /* Phase 3: 通用空间耗尽 → 创建 nearby pool */
+    ExecPool* near_pool = create_pool_near(target);
+    return near_pool ? alloc_from_pool(near_pool, size) : NULL;
 }
 
 /* 在 target ±max_range 范围内分配可执行内存。

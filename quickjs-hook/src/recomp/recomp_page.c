@@ -33,7 +33,7 @@ static int is_branch_type(Arm64InsnType type) {
 
 /* 判断指令是否不可能 fall-through（无条件跳转/返回） */
 static int is_unconditional_transfer(Arm64InsnType type) {
-    return type == ARM64_INSN_B || type == ARM64_INSN_BR || type == ARM64_INSN_RET;
+    return type == ARM64_INSN_B || type == ARM64_INSN_BR || type == ARM64_INSN_BLR || type == ARM64_INSN_RET;
 }
 
 /* ============================================================================
@@ -192,6 +192,21 @@ static int emit_trampoline(
          * 注意: 使用 X17 替代 X16 做 scratch（X16 可能被编译器用作通用寄存器） */
         arm64_writer_put_mov_reg_imm(w, ARM64_REG_X30, orig_ret_addr);
         arm64_writer_put_branch_address_reg(w, info->target, ARM64_REG_X17);
+        break;
+
+    /* ---- BLR ---- */
+    case ARM64_INSN_BLR:
+        /* BLR 同样会隐式写 LR = recomp_pc + 4，这会把返回地址泄露为 recomp VA。
+         * 改成手动设置 LR = 原始返回地址，再 BR 到原寄存器目标。 */
+        if (info->reg == ARM64_REG_X30) {
+            /* 目标寄存器就是 LR，先借 X17 保存原目标，再覆写 LR。 */
+            arm64_writer_put_mov_reg_reg(w, ARM64_REG_X17, ARM64_REG_X30);
+            arm64_writer_put_mov_reg_imm(w, ARM64_REG_X30, orig_ret_addr);
+            arm64_writer_put_br_reg(w, ARM64_REG_X17);
+        } else {
+            arm64_writer_put_mov_reg_imm(w, ARM64_REG_X30, orig_ret_addr);
+            arm64_writer_put_br_reg(w, info->reg);
+        }
         break;
 
     /* ---- B.cond ---- */
@@ -373,17 +388,21 @@ int recompile_page(
             continue;
         }
 
-        /* 1) 非 PC 相对指令：直接复制 */
-        if (!info.is_pc_relative) {
+        /* 1) 非 PC 相对指令：直接复制
+         * 但 BLR 会隐式写 LR = recomp_pc + 4，绝不能直接复制。 */
+        if (!info.is_pc_relative && info.type != ARM64_INSN_BLR) {
             recomp_insns[i] = insn;
             local_stats.num_copied++;
             continue;
         }
 
         /* 2) 页内分支：偏移不变，直接复制
-         *    只对分支类指令做此优化（目标也在重编译页中执行）
-         *    ADR/ADRP/LDR literal 始终引用原始地址，不做此优化 */
+         *    只对非调用型分支做此优化。BL/BLR 绝不能直接复制/直重定位，
+         *    否则 LR 会落在 recomp 页而不是原始 OAT 页，ART 在
+         *    dex_pc / CodeInfo / quick resolve 路径上会用错返回地址。 */
         if (is_branch_type(info.type) &&
+            info.type != ARM64_INSN_BL &&
+            info.type != ARM64_INSN_BLR &&
             info.target >= orig_base &&
             info.target < orig_base + RECOMP_PAGE_SIZE) {
             recomp_insns[i] = insn;
@@ -392,9 +411,10 @@ int recompile_page(
         }
 
         /* 3) 尝试直接调整立即数 */
-        uint32_t relocated;
-        Arm64RelocResult rr = arm64_relocator_relocate_insn(
-            orig_pc, recomp_pc, insn, &relocated);
+        uint32_t relocated = 0;
+        Arm64RelocResult rr = (info.type == ARM64_INSN_BL || info.type == ARM64_INSN_BLR)
+            ? ARM64_RELOC_OUT_OF_RANGE
+            : arm64_relocator_relocate_insn(orig_pc, recomp_pc, insn, &relocated);
 
         if (rr == ARM64_RELOC_OK) {
             recomp_insns[i] = relocated;
@@ -520,4 +540,3 @@ done:
 
     return local_stats.error ? -1 : 0;
 }
-

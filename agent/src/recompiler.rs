@@ -14,7 +14,7 @@
 use crate::communication::log_msg;
 use crate::vma_name::set_anon_vma_name_raw;
 use libc::{
-    mprotect, munmap, sysconf, PROT_EXEC, PROT_READ, PROT_WRITE,
+    mmap, mprotect, munmap, sysconf, MAP_ANONYMOUS, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE,
     _SC_PAGESIZE,
 };
 use std::collections::HashMap;
@@ -29,7 +29,7 @@ const PR_RECOMPILE_REGISTER: i32 = 0x52430001;
 const PR_RECOMPILE_RELEASE: i32 = 0x52430002;
 
 const PAGE_SIZE: usize = 4096;
-const TRAMPOLINE_PAGES: usize = 4; // 每个重编译页最多 4 页跳板空间
+const MAX_TRAMPOLINE_PAGES: usize = 16; // 远距 recomp 时需要更多跳板空间
 
 static VMA_RECOMP_CODE: &[u8] = b"wwb_recomp_code\0";
 static VMA_RECOMP_TRAMP: &[u8] = b"wwb_recomp_tramp\0";
@@ -107,6 +107,8 @@ struct RecompiledPage {
     recomp_total_size: usize,
     /// 跳板区已使用字节数
     tramp_used: usize,
+    /// 跳板区总容量（字节）
+    tramp_capacity: usize,
     /// 是否已在内核注册
     registered: bool,
 }
@@ -154,13 +156,14 @@ pub fn recompile(addr: usize, pid: u32) -> Result<(usize, RecompileStats)> {
     let recomp_base = t.recomp_base;
     let total_size = t.total_size;
     let tramp_used = t.tramp_used;
+    let tramp_capacity = t.tramp_capacity;
     let stats = RecompileStats::from(&t.stats);
     std::mem::forget(t); // 所有权转移到 RecompiledPage
 
     // 命名 VMA
     let tramp_ptr = unsafe { recomp_ptr.add(PAGE_SIZE) };
     let _ = set_anon_vma_name_raw(recomp_ptr, PAGE_SIZE, VMA_RECOMP_CODE);
-    let _ = set_anon_vma_name_raw(tramp_ptr, TRAMPOLINE_PAGES * PAGE_SIZE, VMA_RECOMP_TRAMP);
+    let _ = set_anon_vma_name_raw(tramp_ptr, tramp_capacity, VMA_RECOMP_TRAMP);
 
     // 刷新 icache + 设为 R-X
     unsafe {
@@ -210,6 +213,7 @@ pub fn recompile(addr: usize, pid: u32) -> Result<(usize, RecompileStats)> {
         recomp_ptr,
         recomp_total_size: total_size,
         tramp_used,
+        tramp_capacity,
         registered,
     };
 
@@ -390,7 +394,7 @@ pub fn patch_with_trampoline(orig_addr: usize, jump_dest: usize) -> Result<usize
 
     // 跳板区在 recomp 页之后 (recomp_ptr + PAGE_SIZE)
     let tramp_base = unsafe { page.recomp_ptr.add(PAGE_SIZE) };
-    let tramp_cap = TRAMPOLINE_PAGES * PAGE_SIZE;
+    let tramp_cap = page.tramp_capacity;
     let slot_size = 20usize; // ADRP+ADD+BR (12) 或 MOVZ+MOVK+BR (16)，留 20 足够
     if page.tramp_used + slot_size > tramp_cap {
         return Err("recomp 跳板区已满".into());
@@ -461,7 +465,7 @@ pub fn alloc_trampoline_slot(orig_addr: usize) -> Result<usize> {
 
     // 跳板区在 recomp 页之后
     let tramp_base = unsafe { page.recomp_ptr.add(PAGE_SIZE) };
-    let tramp_cap = TRAMPOLINE_PAGES * PAGE_SIZE;
+    let tramp_cap = page.tramp_capacity;
     let slot_size = 32usize; // 预留足够空间给 hook engine 写 full jump + trampoline
     if page.tramp_used + slot_size > tramp_cap {
         return Err("recomp 跳板区已满".into());
@@ -511,6 +515,7 @@ struct TempRecomp {
     total_size: usize,
     recomp_base: u64,
     tramp_used: usize,
+    tramp_capacity: usize,
     stats: RecompileStatsC,
 }
 
@@ -526,44 +531,77 @@ fn do_recompile_temp(orig_base: usize) -> Result<TempRecomp> {
         ptr::copy_nonoverlapping(orig_base as *const u8, orig_code.as_mut_ptr(), PAGE_SIZE);
     }
 
-    let total_size = PAGE_SIZE + TRAMPOLINE_PAGES * PAGE_SIZE;
-    // 严格保证 recomp 页在原始代码 ±128MB 内（B 指令 + ADRP 直接重定位均可达）。
-    // 不能靠 mmap(hint) 碰运气 — pool 分配可能占掉 hint 附近的空隙。
-    extern "C" {
-        fn hook_mmap_near_range(target: *mut libc::c_void, alloc_size: usize, max_range: i64) -> *mut libc::c_void;
-    }
-    let recomp_ptr = unsafe {
-        hook_mmap_near_range(orig_base as *mut libc::c_void, total_size, 1i64 << 27)
-    };
-    if recomp_ptr == libc::MAP_FAILED {
-        return Err(format!("hook_mmap_near_range(±128MB): {}", Error::last_os_error()));
-    }
-    // hook_mmap_near_range 返回 RWX，后续 mprotect 改为 R-X
-    let recomp_ptr = recomp_ptr as *mut u8;
-    let recomp_base = recomp_ptr as u64;
-    let tramp_ptr = unsafe { recomp_ptr.add(PAGE_SIZE) };
-    let tramp_base = recomp_base + PAGE_SIZE as u64;
-    let tramp_cap = TRAMPOLINE_PAGES * PAGE_SIZE;
+    // recomp 本体不需要靠近原始页；真正需要近距离的是 recomp 内部的 slot/thunk。
+    // 这里改用普通 mmap，消除 ±128MB 近址分配失败。
+    // 同时按需放大跳板区，平衡内存占用和 trampoline 容量。
+    for tramp_pages in [4usize, 8, MAX_TRAMPOLINE_PAGES] {
+        let total_size = PAGE_SIZE + tramp_pages * PAGE_SIZE;
+        let tramp_cap = tramp_pages * PAGE_SIZE;
+        let recomp_ptr = unsafe {
+            mmap(
+                std::ptr::null_mut(),
+                total_size,
+                PROT_READ | PROT_WRITE | PROT_EXEC,
+                MAP_PRIVATE | MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if recomp_ptr == libc::MAP_FAILED {
+            let err = Error::last_os_error();
+            if tramp_pages == MAX_TRAMPOLINE_PAGES {
+                return Err(format!("mmap recomp region: {}", err));
+            }
+            log_msg(format!(
+                "[recompiler] mmap recomp region failed (tramp_pages={}): {}",
+                tramp_pages, err
+            ));
+            continue;
+        }
 
-    let mut tramp_used: usize = 0;
-    let mut stats = RecompileStatsC::new();
+        let recomp_ptr = recomp_ptr as *mut u8;
+        let recomp_base = recomp_ptr as u64;
+        let tramp_ptr = unsafe { recomp_ptr.add(PAGE_SIZE) };
+        let tramp_base = recomp_base + PAGE_SIZE as u64;
 
-    let ret = unsafe {
-        recompile_page(
-            orig_code.as_ptr(), orig_base as u64,
-            recomp_ptr, recomp_base,
-            tramp_ptr, tramp_base, tramp_cap,
-            &mut tramp_used, &mut stats,
-        )
-    };
+        let mut tramp_used: usize = 0;
+        let mut stats = RecompileStatsC::new();
 
-    if ret != 0 {
+        let ret = unsafe {
+            recompile_page(
+                orig_code.as_ptr(), orig_base as u64,
+                recomp_ptr, recomp_base,
+                tramp_ptr, tramp_base, tramp_cap,
+                &mut tramp_used, &mut stats,
+            )
+        };
+
+        if ret == 0 {
+            return Ok(TempRecomp {
+                orig_code,
+                recomp_ptr,
+                total_size,
+                recomp_base,
+                tramp_used,
+                tramp_capacity: tramp_cap,
+                stats,
+            });
+        }
+
         let msg = std::str::from_utf8(&stats.error_msg).unwrap_or("?").trim_end_matches('\0');
         unsafe { munmap(recomp_ptr as *mut _, total_size) };
-        return Err(format!("重编译失败: {}", msg));
+
+        if !msg.contains("跳板区空间不足") || tramp_pages == MAX_TRAMPOLINE_PAGES {
+            return Err(format!("重编译失败: {}", msg));
+        }
+
+        log_msg(format!(
+            "[recompiler] tramp_pages={} 不足，升级跳板区后重试: 0x{:x}",
+            tramp_pages, orig_base
+        ));
     }
 
-    Ok(TempRecomp { orig_code, recomp_ptr, total_size, recomp_base, tramp_used, stats })
+    Err("重编译失败: 未找到可用的跳板区配置".to_string())
 }
 
 /// Dry-run：只重编译不注册 prctl，对比原始 vs 重编译指令

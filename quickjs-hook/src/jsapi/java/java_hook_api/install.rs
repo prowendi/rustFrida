@@ -168,6 +168,7 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
 
     let return_type = get_return_type_from_sig(&actual_sig);
     let has_independent_code = !is_art_quick_entrypoint(original_entry_point, bridge);
+    let is_constructor = method_name == "<init>";
 
     output_message(&format!(
         "[java hook] Step 4: has_independent_code={} (ep={:#x})",
@@ -245,6 +246,7 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
         env,
         clone_addr,
         art_method,
+        is_constructor,
     ) {
         Ok(target) => target,
         Err(msg) => return throw_internal_error(ctx, msg),

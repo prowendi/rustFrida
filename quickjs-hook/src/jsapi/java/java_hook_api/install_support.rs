@@ -210,12 +210,12 @@ pub(super) unsafe fn install_per_method_router_hook(
     env: JniEnv,
     clone_addr: u64,
     art_method: u64,
+    _force_interpreter_route: bool,
 ) -> Result<Option<u64>, String> {
     if has_independent_code {
         // Layer 3: inline hook quickCode 作为快速路径 (直接调用场景)
         let mut hooked_target: *mut std::ffi::c_void = std::ptr::null_mut();
-        let (hook_addr, sflag) = prepare_hook_target(
-            original_entry_point as u64, env as *mut std::ffi::c_void)
+        let (hook_addr, sflag) = prepare_hook_target(original_entry_point as u64, env as *mut std::ffi::c_void)
             .map_err(|e| format!("prepare_hook_target: {}", e))?;
         let trampoline = hook_ffi::hook_install_art_router(
             hook_addr as *mut std::ffi::c_void,
