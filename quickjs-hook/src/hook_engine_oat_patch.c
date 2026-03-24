@@ -24,7 +24,9 @@ static recomp_translate_fn g_recomp_translate = NULL;
 
 void hook_set_recomp_translate(recomp_translate_fn fn) {
     g_recomp_translate = fn;
-    g_stealth_mode = fn ? 2 : 0;
+    /* 仅在设置 recomp 回调时更新 stealth mode 为 2;
+     * 清除回调时不重置 mode (由 hook_set_stealth_mode 单独控制) */
+    if (fn) g_stealth_mode = 2;
 }
 
 void hook_set_stealth_mode(int mode) {
@@ -544,6 +546,8 @@ static int apply_oat_inline_patch(
     *patch_size_out = overwrite;
 
     /* Apply patch */
+    hook_log("[oat_patch] apply: addr=%#lx overwrite=%d stealth_mode=%d",
+             (unsigned long)patch_addr, overwrite, g_stealth_mode);
     if (recomp_addr) {
         /* Recomp 模式 — exec_pc 已正确设为 recomp_addr */
         uintptr_t recomp_page = recomp_addr & ~(page_size - 1);
