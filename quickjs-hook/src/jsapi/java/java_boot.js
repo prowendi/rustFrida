@@ -267,11 +267,24 @@
                 if (prop === "__jptr") return target.__jptr;
                 if (prop === "__jclass") return target.__jclass;
                 if (prop === Symbol.toPrimitive) return function(hint) {
+                    if (hint === "string" || hint === "default") {
+                        try {
+                            return String(_invokeJavaMethod(target.__jptr, target.__jclass, "toString", "()Ljava/lang/String;", []));
+                        } catch(e) {}
+                    }
                     return "[JavaObject:" + target.__jclass + "@" + target.__jptr + "]";
                 };
                 if (typeof prop !== "string") return undefined;
-                if (prop === "toString" || prop === "valueOf") return function() {
-                    return "[JavaObject:" + target.__jclass + "]";
+                if (prop === "toString") return function() {
+                    // 调用 Java 的 toString() 方法获取有意义的字符串表示
+                    try {
+                        return _invokeJavaMethod(target.__jptr, target.__jclass, "toString", "()Ljava/lang/String;", []);
+                    } catch(e) {
+                        return "[JavaObject:" + target.__jclass + "]";
+                    }
+                };
+                if (prop === "valueOf") return function() {
+                    return "[JavaObject:" + target.__jclass + "@" + target.__jptr + "]";
                 };
                 if (prop === "$className") return target.__jclass;
                 if (prop === "$call") {
