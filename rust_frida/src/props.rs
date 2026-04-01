@@ -614,10 +614,11 @@ fn alloc_prop_info(
 
         *alloc_pos = end;
     } else {
-        // short
-        data[data_start + pi_off..data_start + pi_off + 4]
-            .copy_from_slice(&2u32.to_le_bytes()); // serial = 2
+        // short: serial 高 8 位 = 值长度 (SERIAL_VALUE_LEN)
         let vlen = vb.len().min(PROP_VALUE_MAX - 1);
+        let serial = ((vlen as u32) << 24) | 2u32;
+        data[data_start + pi_off..data_start + pi_off + 4]
+            .copy_from_slice(&serial.to_le_bytes());
         data[data_start + pi_off + 4..data_start + pi_off + 4 + vlen]
             .copy_from_slice(&vb[..vlen]);
         let noff = pi_off + 4 + PROP_VALUE_MAX;
