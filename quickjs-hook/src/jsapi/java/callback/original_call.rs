@@ -125,8 +125,9 @@ unsafe fn marshal_js_to_jvalue(
                 }
                 jptr_val.free(ctx);
             }
-            // Autobox: JS number/boolean/bigint → Java 包装类型 (Integer/Boolean/Long/Double)
-            if let Some(boxed) = autobox_primitive_to_jobject(ctx, env, val) {
+            // Autobox: JS number/boolean/bigint → Java 包装类型
+            // 传入目标类型签名，精确匹配 Long/Float/Short/Byte 等
+            if let Some(boxed) = autobox_primitive_to_jobject(ctx, env, val, sig) {
                 return boxed;
             }
             0
@@ -136,16 +137,16 @@ unsafe fn marshal_js_to_jvalue(
 }
 
 /// Autobox JS primitive → Java wrapper object via JNI static valueOf().
-/// number(int-range) → Integer, number(other) → Double, boolean → Boolean, bigint → Long.
+/// 根据目标类型签名精确选择装箱类型，fallback 到默认推断。
 unsafe fn autobox_primitive_to_jobject(
     _ctx: *mut ffi::JSContext,
     env: JniEnv,
     val: JSValue,
+    target_sig: &str,
 ) -> Option<u64> {
     use super::jni_core::*;
     use super::reflect::find_class_safe;
 
-    // 通用 valueOf 调用: FindClass → GetStaticMethodID → CallStaticObjectMethodA
     macro_rules! box_via_valueof {
         ($class:expr, $sig:expr, $raw:expr) => {{
             let cls = find_class_safe(env, $class);
@@ -163,26 +164,41 @@ unsafe fn autobox_primitive_to_jobject(
         }};
     }
 
-    // boolean → Boolean.valueOf(boolean)
+    // boolean → Boolean
     if val.is_bool() {
         let b = val.to_bool().unwrap_or(false);
         return box_via_valueof!("java/lang/Boolean", b"(Z)Ljava/lang/Boolean;\0", b as u64);
     }
 
-    // number → Integer.valueOf(int) 或 Double.valueOf(double)
+    // number → 根据目标签名选择精确的包装类型
     if let Some(f) = val.to_float() {
-        let fits_int = f == (f as i32 as f64) && f.abs() < (i32::MAX as f64);
-        return if fits_int {
-            box_via_valueof!("java/lang/Integer", b"(I)Ljava/lang/Integer;\0", f as i32 as u32 as u64)
-        } else {
-            box_via_valueof!("java/lang/Double", b"(D)Ljava/lang/Double;\0", f.to_bits())
+        return match target_sig {
+            "Ljava/lang/Byte;" => box_via_valueof!("java/lang/Byte", b"(B)Ljava/lang/Byte;\0", f as i8 as u8 as u64),
+            "Ljava/lang/Short;" => box_via_valueof!("java/lang/Short", b"(S)Ljava/lang/Short;\0", f as i16 as u16 as u64),
+            "Ljava/lang/Long;" => box_via_valueof!("java/lang/Long", b"(J)Ljava/lang/Long;\0", f as i64 as u64),
+            "Ljava/lang/Float;" => box_via_valueof!("java/lang/Float", b"(F)Ljava/lang/Float;\0", (f as f32).to_bits() as u64),
+            "Ljava/lang/Double;" => box_via_valueof!("java/lang/Double", b"(D)Ljava/lang/Double;\0", f.to_bits()),
+            "Ljava/lang/Integer;" => box_via_valueof!("java/lang/Integer", b"(I)Ljava/lang/Integer;\0", f as i32 as u32 as u64),
+            _ => {
+                // 默认: int 范围→Integer, 否则→Double
+                let fits_int = f == (f as i32 as f64) && f.abs() < (i32::MAX as f64);
+                if fits_int {
+                    box_via_valueof!("java/lang/Integer", b"(I)Ljava/lang/Integer;\0", f as i32 as u32 as u64)
+                } else {
+                    box_via_valueof!("java/lang/Double", b"(D)Ljava/lang/Double;\0", f.to_bits())
+                }
+            }
         };
     }
 
-    // bigint / i64 → Long.valueOf(long)
-    // (not int, not float → must be bigint if to_i64 succeeds)
+    // bigint → 根据目标签名选择
     if let Some(n) = val.to_i64(_ctx) {
-        return box_via_valueof!("java/lang/Long", b"(J)Ljava/lang/Long;\0", n as u64);
+        return match target_sig {
+            "Ljava/lang/Integer;" => box_via_valueof!("java/lang/Integer", b"(I)Ljava/lang/Integer;\0", n as i32 as u32 as u64),
+            "Ljava/lang/Short;" => box_via_valueof!("java/lang/Short", b"(S)Ljava/lang/Short;\0", n as i16 as u16 as u64),
+            "Ljava/lang/Byte;" => box_via_valueof!("java/lang/Byte", b"(B)Ljava/lang/Byte;\0", n as i8 as u8 as u64),
+            _ => box_via_valueof!("java/lang/Long", b"(J)Ljava/lang/Long;\0", n as u64),
+        };
     }
 
     None

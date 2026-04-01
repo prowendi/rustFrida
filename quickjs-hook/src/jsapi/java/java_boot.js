@@ -95,9 +95,21 @@
             }
             // L 引用类型
             if (jt === "string") return jniType === "Ljava/lang/String;" ? 3 : 1;
-            if (jt === "number") return jniType === "Ljava/lang/Integer;" || jniType === "Ljava/lang/Number;" ? 3 : 1;
+            if (jt === "number") {
+                // 精确包装类型(3) > 兼容数值类型(2) > 泛型Object(1)
+                var numBoxed = {
+                    "Ljava/lang/Integer;":3, "Ljava/lang/Double;":3,
+                    "Ljava/lang/Float;":2, "Ljava/lang/Long;":2,
+                    "Ljava/lang/Short;":2, "Ljava/lang/Byte;":2,
+                    "Ljava/lang/Number;":2, "Ljava/lang/Character;":2
+                };
+                return numBoxed[jniType] || 1;
+            }
             if (jt === "boolean") return jniType === "Ljava/lang/Boolean;" ? 3 : 1;
-            if (jt === "bigint") return jniType === "Ljava/lang/Long;" ? 3 : 1;
+            if (jt === "bigint") {
+                return jniType === "Ljava/lang/Long;" ? 3
+                     : (jniType === "Ljava/lang/Integer;" || jniType === "Ljava/lang/Number;" ? 2 : 1);
+            }
             if (jt === "object") return 2;
             return 1; // 兜底: 其他 JS 类型 → Object
         }
