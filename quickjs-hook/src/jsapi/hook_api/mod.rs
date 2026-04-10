@@ -12,7 +12,7 @@ use crate::jsapi::callback_util::set_js_u64_property;
 use crate::jsapi::util::add_cfunction_to_object;
 
 use callback::{in_flight_native_hook_callbacks, wait_for_in_flight_native_hook_callbacks};
-use functions::{js_call_native, js_diag_alloc_near, js_hook, js_recomp_hook, js_unhook};
+use functions::{js_call_native, js_diag_alloc_near, js_hook, js_native_call, js_recomp_hook, js_unhook};
 #[cfg(feature = "qbdi")]
 pub use qbdi::preload_qbdi_helper;
 #[cfg(feature = "qbdi")]
@@ -31,6 +31,8 @@ pub fn register_hook_api(ctx: &JSContext) {
         add_cfunction_to_object(ctx.as_ptr(), g, "callNative", js_call_native, 1);
         add_cfunction_to_object(ctx.as_ptr(), g, "recompHook", js_recomp_hook, 2);
         add_cfunction_to_object(ctx.as_ptr(), g, "diagAllocNear", js_diag_alloc_near, 1);
+        // __nativeCall: 底层 shim，由 JS 侧的 NativeFunction wrapper 调用
+        add_cfunction_to_object(ctx.as_ptr(), g, "__nativeCall", js_native_call, 6);
 
         // Hook.NORMAL = 0, Hook.WXSHADOW = 1, Hook.RECOMP = 2
         let hook_obj = ffi::JS_NewObject(ctx.as_ptr());
@@ -48,6 +50,13 @@ pub fn register_hook_api(ctx: &JSContext) {
     }
 
     global.free(ctx.as_ptr());
+
+    // Load NativeFunction JS wrapper (Frida-compatible API)
+    let boot = include_str!("native_boot.js");
+    match ctx.eval(boot, "<native_boot>") {
+        Ok(val) => val.free(ctx.as_ptr()),
+        Err(e) => crate::jsapi::console::output_message(&format!("[hook_api] native_boot error: {}", e)),
+    }
 }
 
 /// Cleanup all hooks (call before dropping context)

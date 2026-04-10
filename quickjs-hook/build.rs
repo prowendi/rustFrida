@@ -6,7 +6,8 @@ fn main() {
     let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
     let src_path = PathBuf::from(&manifest_dir).join("src");
 
-    // Compile hook_engine.c, arm64_writer.c, and arm64_relocator.c
+    // Compile hook_engine.c, arm64_writer.c, arm64_relocator.c,
+    // 以及 native_call.S (AAPCS64 变参调用 shim)
     cc::Build::new()
         .file(src_path.join("hook_engine.c"))
         .file(src_path.join("hook_engine_mem.c"))
@@ -17,6 +18,7 @@ fn main() {
         .file(src_path.join("arm64_writer.c"))
         .file(src_path.join("arm64_relocator.c"))
         .file(src_path.join("recomp/recomp_page.c"))
+        .file(src_path.join("native_call.S"))
         .include(&src_path)
         .include(src_path.join("recomp"))
         .opt_level(2)
@@ -151,6 +153,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/arm64_relocator.h");
     println!("cargo:rerun-if-changed=src/recomp/recomp_page.c");
     println!("cargo:rerun-if-changed=src/recomp/recomp_page.h");
+    println!("cargo:rerun-if-changed=src/native_call.S");
     println!("cargo:rerun-if-changed=quickjs-src/VERSION");
     println!("cargo:rerun-if-changed=quickjs-src/quickjs.c");
     println!("cargo:rerun-if-changed=quickjs-src/quickjs.h");

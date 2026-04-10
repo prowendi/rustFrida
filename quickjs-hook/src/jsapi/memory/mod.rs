@@ -1,5 +1,6 @@
 //! Memory API implementation
 
+mod alloc;
 mod helpers;
 mod read;
 mod write;
@@ -7,6 +8,8 @@ mod write;
 use crate::context::JSContext;
 use crate::jsapi::util::add_cfunction_to_object;
 
+pub(crate) use alloc::cleanup_owned_allocs;
+use alloc::{memory_alloc, memory_alloc_utf8_string, memory_flush_code_cache};
 use read::*;
 use write::*;
 
@@ -18,6 +21,9 @@ pub fn register_memory_api(ctx: &JSContext) {
     unsafe {
         let ctx_ptr = ctx.as_ptr();
         let obj = memory.raw();
+        add_cfunction_to_object(ctx_ptr, obj, "alloc", memory_alloc, 1);
+        add_cfunction_to_object(ctx_ptr, obj, "allocUtf8String", memory_alloc_utf8_string, 1);
+        add_cfunction_to_object(ctx_ptr, obj, "flushCodeCache", memory_flush_code_cache, 2);
         add_cfunction_to_object(ctx_ptr, obj, "readU8", memory_read_u8, 1);
         add_cfunction_to_object(ctx_ptr, obj, "readU16", memory_read_u16, 1);
         add_cfunction_to_object(ctx_ptr, obj, "readU32", memory_read_u32, 1);

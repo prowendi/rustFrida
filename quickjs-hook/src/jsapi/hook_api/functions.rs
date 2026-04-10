@@ -243,6 +243,231 @@ pub(crate) unsafe extern "C" fn js_call_native(
     js_i64_to_js_number_or_bigint(ctx, result)
 }
 
+// ─────────────────────────── NativeFunction API ──────────────────────────────
+//
+// Frida-compatible native 函数调用器。通过 ARM64 AAPCS64 register-passing
+// 约定调用任意签名的 native 函数，支持最多 8 个整数参数 (x0-x7) + 8 个浮点
+// 参数 (d0-d7)，以及 void/bool/int*/long/size_t/pointer/float/double 返回值。
+//
+// 使用方式（与 Frida 完全一致）:
+//   var open = new NativeFunction(
+//       Module.findExportByName('libc.so', 'open'),
+//       'int',
+//       ['pointer', 'int']
+//   );
+//   var fd = open(Memory.allocUtf8String('/tmp/foo'), 2);
+//
+// 实现：NativeFunction 在 JS 侧通过 boot script 定义（native_boot.js），
+// 它创建一个闭包保存 addr/retType/argTypes，每次调用时把参数分拆到 GPR/FPR
+// 数组，然后调 __nativeCall(addr, retTypeKind, gprBytes, fprBytes) native 函数。
+// native 函数通过 native_call_shim (asm) 把寄存器装好并跳转到目标。
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeRetKind {
+    Void = 0,
+    Int = 1,      // 整数类型 (bool/char/int/long/size_t/pointer)，从 x0 读
+    Double = 2,   // double / float64，从 d0 读
+    Float32 = 3,  // float (32-bit)，从 s0 读（必须用独立的 extern -> f32 签名）
+}
+
+impl NativeRetKind {
+    fn from_i32(v: i32) -> Option<Self> {
+        match v {
+            0 => Some(Self::Void),
+            1 => Some(Self::Int),
+            2 => Some(Self::Double),
+            3 => Some(Self::Float32),
+            _ => None,
+        }
+    }
+}
+
+extern "C" {
+    /// ARM64 AAPCS64 shim：
+    ///   - gpr[0..8] 载入 x0-x7
+    ///   - fpr[0..8] 载入 d0-d7
+    ///   - stk[0..stk_count] 拷贝到栈上 (每槽 8 字节，caller 分配/释放)
+    ///   - 跳转到 fn_ptr
+    ///
+    /// 三个 extern 签名指向同一个 asm symbol，用不同的 Rust 返回类型告诉
+    /// 编译器从哪个物理寄存器读返回值:
+    ///   -> u64 → x0 (integer/pointer)
+    ///   -> f64 → d0 (double)
+    ///   -> f32 → s0 (float 32-bit，低 32 bits of v0)
+    fn native_call_shim(
+        fn_ptr: *const std::ffi::c_void,
+        gpr: *const u64,
+        fpr: *const f64,
+        stk: *const u64,
+        stk_count: usize,
+    ) -> u64;
+    #[link_name = "native_call_shim"]
+    fn native_call_shim_f64(
+        fn_ptr: *const std::ffi::c_void,
+        gpr: *const u64,
+        fpr: *const f64,
+        stk: *const u64,
+        stk_count: usize,
+    ) -> f64;
+    #[link_name = "native_call_shim"]
+    fn native_call_shim_f32(
+        fn_ptr: *const std::ffi::c_void,
+        gpr: *const u64,
+        fpr: *const f64,
+        stk: *const u64,
+        stk_count: usize,
+    ) -> f32;
+}
+
+/// __nativeCall(addr, retKind, gpr[], fpr[], fprFloatMask, stk[])
+///
+/// - addr: NativePointer / number
+/// - retKind: 0=void, 1=int, 2=double, 3=float32
+/// - gpr[]: length-8 JS Array (BigInt/Number/Pointer) — x0-x7 寄存器参数
+/// - fpr[]: length-8 JS Array (Number)                — d0-d7 寄存器参数
+/// - fprFloatMask: int32 bit mask，bit i=1 表示 fpr[i] 是 float32 而非 float64
+/// - stk[]: 变长 JS Array (BigInt)，溢出参数的**原始 u64 位图**
+///          按声明顺序排列，JS 侧已经把 int/float/double 转好 bit pattern
+///          每槽 8 字节，float32 在低 32 bits、高 32 bits = 0
+///
+/// 无参上限。stk 为空时走无栈溢出快路径。
+pub(crate) unsafe extern "C" fn js_native_call(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    if argc < 6 {
+        return ffi::JS_ThrowTypeError(
+            ctx,
+            b"__nativeCall() requires 6 arguments: addr, retKind, gpr[], fpr[], fprFloatMask, stk[]\0"
+                .as_ptr() as *const _,
+        );
+    }
+    let addr_arg = JSValue(*argv);
+    let kind_arg = JSValue(*argv.add(1));
+    let gpr_arg = JSValue(*argv.add(2));
+    let fpr_arg = JSValue(*argv.add(3));
+    let mask_arg = JSValue(*argv.add(4));
+    let stk_arg = JSValue(*argv.add(5));
+
+    let addr = match extract_pointer_address(ctx, addr_arg, "__nativeCall") {
+        Ok(a) => a,
+        Err(e) => return e,
+    };
+    if addr < 0x10000 || !is_addr_accessible(addr, 4) {
+        return ffi::JS_ThrowRangeError(
+            ctx,
+            b"__nativeCall() address is not mapped\0".as_ptr() as *const _,
+        );
+    }
+    // 检查页是否可执行 (PROT_EXEC): 通过 /proc/self/maps 查 prot 位。
+    // 不依赖 dladdr 因为 Memory.alloc 分配的 RWX 页不在任何 loaded SO 里。
+    {
+        use crate::jsapi::util::{proc_maps_entries, read_proc_self_maps};
+        let maps = read_proc_self_maps();
+        let mut is_exec = false;
+        if let Some(ref m) = maps {
+            for entry in proc_maps_entries(m) {
+                if entry.contains(addr) {
+                    is_exec = (entry.prot_flags() & libc::PROT_EXEC) != 0;
+                    break;
+                }
+            }
+        }
+        if !is_exec {
+            return ffi::JS_ThrowRangeError(
+                ctx,
+                b"__nativeCall() address is not in an executable page\0".as_ptr() as *const _,
+            );
+        }
+    }
+
+    let kind_num = kind_arg.to_i64(ctx).unwrap_or(-1);
+    let kind = match NativeRetKind::from_i32(kind_num as i32) {
+        Some(k) => k,
+        None => {
+            return ffi::JS_ThrowTypeError(
+                ctx,
+                b"__nativeCall() retKind must be 0..3\0".as_ptr() as *const _,
+            );
+        }
+    };
+
+    let fpr_float_mask = mask_arg.to_i64(ctx).unwrap_or(0) as u32;
+
+    // 从 JS Array 读 8 个 u64 → gpr 寄存器组
+    let mut gpr = [0u64; 8];
+    for i in 0..8u32 {
+        let elem = ffi::JS_GetPropertyUint32(ctx, gpr_arg.raw(), i);
+        let v = JSValue(elem);
+        gpr[i as usize] = js_value_to_u64_or_zero(ctx, v);
+        ffi::qjs_free_value(ctx, elem);
+    }
+
+    // 从 JS Array 读 8 个 number → fpr 寄存器组
+    // 对标记为 float32 的槽做 f32 截断：低 32 bits 存 f32 位图，高 32 bits 为 0
+    let mut fpr = [0.0f64; 8];
+    for i in 0..8u32 {
+        let elem = ffi::JS_GetPropertyUint32(ctx, fpr_arg.raw(), i);
+        let v = JSValue(elem);
+        let val = v.to_float().unwrap_or(0.0);
+        ffi::qjs_free_value(ctx, elem);
+        fpr[i as usize] = if (fpr_float_mask >> i) & 1 == 1 {
+            let f32_bits = (val as f32).to_bits() as u64;
+            f64::from_bits(f32_bits)
+        } else {
+            val
+        };
+    }
+
+    // 读取 stk[] 长度 + 每个槽的 u64 值（JS 侧已转成 BigInt）
+    // 上限：256 个溢出参数（2KB 栈空间），足够任何合理调用
+    const MAX_STK: usize = 256;
+    let stk_len = {
+        let len_val = stk_arg.get_property(ctx, "length");
+        let n = len_val.to_i64(ctx).unwrap_or(0);
+        len_val.free(ctx);
+        n.max(0) as usize
+    };
+    if stk_len > MAX_STK {
+        return ffi::JS_ThrowRangeError(
+            ctx,
+            b"__nativeCall() too many stack args (> 256)\0".as_ptr() as *const _,
+        );
+    }
+    let mut stk = [0u64; MAX_STK];
+    for i in 0..stk_len {
+        let elem = ffi::JS_GetPropertyUint32(ctx, stk_arg.raw(), i as u32);
+        let v = JSValue(elem);
+        stk[i] = js_value_to_u64_or_zero(ctx, v);
+        ffi::qjs_free_value(ctx, elem);
+    }
+
+    let fn_ptr = addr as *const std::ffi::c_void;
+    let stk_ptr = stk.as_ptr();
+
+    match kind {
+        NativeRetKind::Void => {
+            native_call_shim(fn_ptr, gpr.as_ptr(), fpr.as_ptr(), stk_ptr, stk_len);
+            JSValue::undefined().raw()
+        }
+        NativeRetKind::Int => {
+            let r = native_call_shim(fn_ptr, gpr.as_ptr(), fpr.as_ptr(), stk_ptr, stk_len);
+            js_i64_to_js_number_or_bigint(ctx, r as i64)
+        }
+        NativeRetKind::Double => {
+            let r = native_call_shim_f64(fn_ptr, gpr.as_ptr(), fpr.as_ptr(), stk_ptr, stk_len);
+            ffi::qjs_new_float64(ctx, r)
+        }
+        NativeRetKind::Float32 => {
+            let r = native_call_shim_f32(fn_ptr, gpr.as_ptr(), fpr.as_ptr(), stk_ptr, stk_len);
+            ffi::qjs_new_float64(ctx, r as f64)
+        }
+    }
+}
+
 /// diagAllocNear(addr) - 诊断 hook_alloc_near 对指定地址的有效性
 pub(crate) unsafe extern "C" fn js_diag_alloc_near(
     ctx: *mut ffi::JSContext,
