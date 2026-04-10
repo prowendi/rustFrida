@@ -19,6 +19,8 @@ const FRAME_KIND_LOG: u8 = 0x81;
 const FRAME_KIND_COMPLETE: u8 = 0x82;
 const FRAME_KIND_EVAL_OK: u8 = 0x83;
 const FRAME_KIND_EVAL_ERR: u8 = 0x84;
+const FRAME_KIND_RPC_OK: u8 = 0x85;
+const FRAME_KIND_RPC_ERR: u8 = 0x86;
 
 /// Write-half of the agent↔host socket, protected by Mutex to serialize messages.
 /// 控制消息 (HELLO/COMPLETE/EVAL_OK/EVAL_ERR) 直接走此 stream。
@@ -142,6 +144,26 @@ pub(crate) fn send_eval_err(text: &str) {
         let _ = write_frame(
             &mut m.lock().unwrap_or_else(|e| e.into_inner()),
             FRAME_KIND_EVAL_ERR,
+            text.as_bytes(),
+        );
+    }
+}
+
+pub(crate) fn send_rpc_ok(text: &str) {
+    if let Some(m) = GLOBAL_STREAM.get() {
+        let _ = write_frame(
+            &mut m.lock().unwrap_or_else(|e| e.into_inner()),
+            FRAME_KIND_RPC_OK,
+            text.as_bytes(),
+        );
+    }
+}
+
+pub(crate) fn send_rpc_err(text: &str) {
+    if let Some(m) = GLOBAL_STREAM.get() {
+        let _ = write_frame(
+            &mut m.lock().unwrap_or_else(|e| e.into_inner()),
+            FRAME_KIND_RPC_ERR,
             text.as_bytes(),
         );
     }

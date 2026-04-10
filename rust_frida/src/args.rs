@@ -144,4 +144,15 @@ pub(crate) struct Args {
     /// 配合 --profile 使用可在整个 server 生命周期内持续生效。
     #[arg(long = "server", conflicts_with_all = ["pid", "watch_so", "name", "spawn"])]
     pub(crate) server: bool,
+
+    /// 启动 HTTP RPC 服务器，暴露 agent 端 `rpc.exports` 注册的方法。
+    ///
+    /// 格式: --rpc-port <PORT> 或 --rpc-port <HOST:PORT>（默认绑定 0.0.0.0）。
+    /// 路由：
+    ///   GET  /sessions                        列出 session
+    ///   POST /rpc/<session>/<method>          调用 rpc.exports[method]，请求体为 JSON 参数数组
+    ///
+    /// 在 legacy 模式下 session_id 为 0，在 --server 模式下为 list 命令显示的 id。
+    #[arg(long = "rpc-port", value_name = "PORT_OR_ADDR")]
+    pub(crate) rpc_port: Option<String>,
 }

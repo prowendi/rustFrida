@@ -14,6 +14,30 @@ use crate::log_error;
 use crate::logger::{GRAY, GREEN, HIGHLIGHT_BG, HIGHLIGHT_FG, RED, RESET, YELLOW};
 use crate::session::Session;
 
+/// 构造一个带可选 filename 前缀的 `loadjs` 命令字符串。
+///
+/// 当 `script_path` 非空时会提取 basename 作为 QuickJS 的 source filename，
+/// 错误信息会显示 `script.js:line:col` 而不是 `<eval>:line:col`。
+///
+/// 脚本本身保留原始换行，不做任何 `\n → \r` 替换（wire 协议是长度前缀的二进制帧，
+/// 支持任意字节）。
+pub(crate) fn build_loadjs_cmd(script: &str, script_path: Option<&str>) -> String {
+    if let Some(path) = script_path {
+        let name = std::path::Path::new(path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("script.js");
+        // filename 内含 `[` / `]` / `\n` 会破坏解析，fallback 到 <eval>
+        if name.contains('[') || name.contains(']') || name.contains('\n') {
+            format!("loadjs {}", script)
+        } else {
+            format!("loadjs [{}]\n{}", name, script)
+        }
+    } else {
+        format!("loadjs {}", script)
+    }
+}
+
 /// 当前构建实际可用的命令列表（编译时由 feature 控制）
 pub(crate) fn commands() -> &'static [(&'static str, &'static str, &'static str)] {
     static CMDS: OnceLock<Vec<(&'static str, &'static str, &'static str)>> = OnceLock::new();

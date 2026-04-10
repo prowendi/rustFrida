@@ -22,6 +22,8 @@ const FRAME_KIND_LOG: u8 = 0x81;
 const FRAME_KIND_COMPLETE: u8 = 0x82;
 const FRAME_KIND_EVAL_OK: u8 = 0x83;
 const FRAME_KIND_EVAL_ERR: u8 = 0x84;
+const FRAME_KIND_RPC_OK: u8 = 0x85;
+const FRAME_KIND_RPC_ERR: u8 = 0x86;
 
 #[derive(Clone)]
 pub(crate) enum HostToAgentMessage {
@@ -196,8 +198,19 @@ fn handle_socket_connection(stream: UnixStream, session: Arc<Session>) {
                         .send(Ok(String::from_utf8(payload).unwrap_or_default()));
                 }
                 FRAME_KIND_EVAL_ERR => {
-                    let content = String::from_utf8(payload).unwrap_or_default().replace('\r', "\n");
-                    session.eval_state.send(Err(content));
+                    session
+                        .eval_state
+                        .send(Err(String::from_utf8(payload).unwrap_or_default()));
+                }
+                FRAME_KIND_RPC_OK => {
+                    session
+                        .rpc_state
+                        .send(Ok(String::from_utf8(payload).unwrap_or_default()));
+                }
+                FRAME_KIND_RPC_ERR => {
+                    session
+                        .rpc_state
+                        .send(Err(String::from_utf8(payload).unwrap_or_default()));
                 }
                 FRAME_KIND_LOG => {
                     let msg = String::from_utf8(payload).unwrap_or_default();

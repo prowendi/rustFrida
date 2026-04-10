@@ -2,6 +2,7 @@
 
 mod args;
 mod communication;
+mod http_rpc;
 mod injection;
 mod logger;
 mod proc_mem;
@@ -14,6 +15,17 @@ mod session;
 mod spawn;
 mod types;
 
+/// 解析 `--rpc-port` 参数为绑定地址：
+/// * 纯数字 → `0.0.0.0:<port>`
+/// * 带冒号 → 原样使用（例如 `127.0.0.1:9191`）
+pub(crate) fn parse_rpc_bind(arg: &str) -> String {
+    if arg.contains(':') {
+        arg.to_string()
+    } else {
+        format!("0.0.0.0:{}", arg)
+    }
+}
+
 use crate::logger::{DIM, RESET};
 use args::Args;
 use clap::Parser;
@@ -22,10 +34,10 @@ use communication::send_qbdi_helper;
 use communication::{send_command, start_socketpair_handler};
 use injection::{inject_via_bootstrapper, watch_and_inject};
 use process::find_pid_by_name;
-use repl::{print_eval_result, print_help, run_js_repl, CommandCompleter};
+use repl::{build_loadjs_cmd, print_eval_result, print_help, run_js_repl, CommandCompleter};
 use rustyline::error::ReadlineError;
 use rustyline::Editor;
-use session::Session;
+use session::{Session, SessionManager};
 use std::os::unix::io::RawFd;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -247,6 +259,17 @@ fn main() {
         let _ = send_command(sender, "__set_verbose__");
     }
 
+    // ── RPC HTTP 服务器（如启用）──
+    // legacy 模式只有一个 session (id=0)，用 SessionManager 包一层供 http_rpc 复用
+    if let Some(ref rpc_arg) = args.rpc_port {
+        let mgr = Arc::new(SessionManager::new());
+        mgr.insert_session(session.clone());
+        let bind = parse_rpc_bind(rpc_arg);
+        if let Err(e) = http_rpc::start(mgr, &bind) {
+            log_error!("{}", e);
+        }
+    }
+
     #[cfg(feature = "qbdi")]
     {
         if let Err(e) = send_qbdi_helper(sender, crate::injection::QBDI_HELPER_SO.to_vec()) {
@@ -278,9 +301,8 @@ fn main() {
                                 None => log_warn!("等待引擎初始化超时"),
                                 Some(Err(e)) => log_error!("引擎初始化失败: {}", e),
                                 Some(Ok(_)) => {
-                                    let script_line = script.replace('\n', "\r");
                                     session.eval_state.clear();
-                                    let cmd = format!("loadjs {}", script_line);
+                                    let cmd = build_loadjs_cmd(&script, Some(script_path));
                                     if let Err(e) = send_command(sender, cmd) {
                                         log_error!("发送 loadjs 失败: {}", e);
                                     } else {
@@ -319,9 +341,8 @@ fn main() {
                             None => log_warn!("等待引擎初始化超时"),
                             Some(Err(e)) => log_error!("引擎初始化失败: {}", e),
                             Some(Ok(_)) => {
-                                let script_line = script.replace('\n', "\r");
                                 session.eval_state.clear();
-                                let cmd = format!("loadjs {}", script_line);
+                                let cmd = build_loadjs_cmd(&script, Some(script_path));
                                 if let Err(e) = send_command(sender, cmd) {
                                     log_error!("发送 loadjs 失败: {}", e);
                                 } else {

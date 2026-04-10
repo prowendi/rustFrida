@@ -10,7 +10,8 @@ use libc::{munmap, sysconf, MAP_FAILED, _SC_PAGESIZE};
 
 use quickjs_hook::{
     cleanup_engine, cleanup_hook_engine, cleanup_hooks, cleanup_java_hooks, complete_script, get_or_init_engine,
-    init_hook_engine, load_script, set_console_callback, set_qbdi_helper_blob, set_qbdi_output_dir,
+    init_hook_engine, load_script, load_script_with_filename, set_console_callback, set_qbdi_helper_blob,
+    set_qbdi_output_dir,
 };
 #[cfg(feature = "qbdi")]
 use quickjs_hook::{preload_qbdi_helper, shutdown_qbdi_helper};
@@ -156,6 +157,15 @@ pub fn execute_script(script: &str) -> Result<String, String> {
     }
 
     load_script(script)
+}
+
+/// Load + execute 指定源文件名的脚本（错误信息会显示 `filename:line:col`）
+pub fn execute_script_with_filename(script: &str, filename: &str) -> Result<String, String> {
+    if !ENGINE_INITIALIZED.load(Ordering::SeqCst) {
+        return Err("JS 引擎未初始化，请先执行 jsinit".to_string());
+    }
+
+    load_script_with_filename(script, filename)
 }
 
 /// Get tab-completion candidates for the given prefix from the live JS engine.

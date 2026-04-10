@@ -164,9 +164,8 @@ fn load_script_on_session(session: &Session, script_path: &str) {
     }
 
     // loadjs
-    let script_line = script.replace('\n', "\r");
     session.eval_state.clear();
-    let cmd = format!("loadjs {}", script_line);
+    let cmd = crate::repl::build_loadjs_cmd(&script, Some(script_path));
     if let Err(e) = send_command(sender, cmd) {
         log_error!("[#{}] 发送 loadjs 失败: {}", session.id, e);
         return;
@@ -494,6 +493,14 @@ pub(crate) fn run_server(args: &Args) {
     match spawn::ensure_zymbiote_loaded() {
         Ok(()) => log_success!("Zygote 预注入完成，spawn 命令将即时生效"),
         Err(e) => log_error!("Zygote 预注入失败: {} (spawn 命令将自动重试)", e),
+    }
+
+    // ── RPC HTTP 服务器（如启用）──
+    if let Some(ref rpc_arg) = args.rpc_port {
+        let bind = crate::parse_rpc_bind(rpc_arg);
+        if let Err(e) = crate::http_rpc::start(mgr.clone(), &bind) {
+            log_error!("{}", e);
+        }
     }
 
     println!(

@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::communication::{HostToAgentMessage, SyncChannel};
+use crate::communication::{send_command, HostToAgentMessage, SyncChannel};
 
 /// 单个注入会话：一个目标进程对应一个 Session
 pub(crate) struct Session {
@@ -15,6 +15,10 @@ pub(crate) struct Session {
     pub(crate) sender: OnceLock<Sender<HostToAgentMessage>>,
     pub(crate) eval_state: SyncChannel<Result<String, String>>,
     pub(crate) complete_state: SyncChannel<Vec<String>>,
+    /// RPC 调用回复通道（与 eval_state 解耦，避免 HTTP RPC 抢占 REPL eval）
+    pub(crate) rpc_state: SyncChannel<Result<String, String>>,
+    /// 串行化并发 RPC 调用：rpc_state 是单槽 channel，多个请求并发会互相覆盖
+    pub(crate) rpc_lock: Mutex<()>,
     pub(crate) connected: AtomicBool,
     pub(crate) disconnected: AtomicBool,
     pub(crate) failed: AtomicBool,
@@ -29,9 +33,48 @@ impl Session {
             sender: OnceLock::new(),
             eval_state: SyncChannel::new(),
             complete_state: SyncChannel::new(),
+            rpc_state: SyncChannel::new(),
+            rpc_lock: Mutex::new(()),
             connected: AtomicBool::new(false),
             disconnected: AtomicBool::new(false),
             failed: AtomicBool::new(false),
+        }
+    }
+
+    /// 向 agent 派发 RPC 调用并等待结果。
+    ///
+    /// * `method`    — 注册在 `rpc.exports` 上的方法名（不能包含空白）
+    /// * `args_json` — 参数 JSON 数组字符串（如 `"[1,2,3]"`），空字符串等价空数组
+    /// * `timeout`   — 等待 agent 回复的超时时间
+    ///
+    /// 返回值为 JSON 字符串化后的结果；`Err` 表示会话未就绪 / 方法不存在 / 超时 / JS 异常。
+    pub(crate) fn rpc_call(
+        &self,
+        method: &str,
+        args_json: &str,
+        timeout: std::time::Duration,
+    ) -> Result<String, String> {
+        if method.is_empty() || method.chars().any(char::is_whitespace) {
+            return Err("invalid rpc method name".to_string());
+        }
+        if !self.is_connected() {
+            return Err("session not connected".to_string());
+        }
+        let sender = self.get_sender().ok_or("session has no sender")?;
+        let cmd = if args_json.is_empty() {
+            format!("rpccall {}", method)
+        } else {
+            format!("rpccall {} {}", method, args_json)
+        };
+        // 串行化并发 RPC 请求；rpc_state 是单槽，不能并发使用。
+        let _guard = self.rpc_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let reply = self.rpc_state.clear_then_recv(timeout, || {
+            let _ = send_command(sender, cmd);
+        });
+        match reply {
+            None => Err("rpc call timed out".to_string()),
+            Some(Ok(s)) => Ok(s),
+            Some(Err(e)) => Err(e),
         }
     }
 
@@ -111,6 +154,12 @@ impl SessionManager {
         let session = Arc::new(Session::new(id, label));
         self.sessions.lock().unwrap().insert(id, session.clone());
         session
+    }
+
+    /// 插入一个已经创建好的 Session（例如 legacy 模式下的 id=0 session）。
+    /// 仅供 HTTP RPC 在非 server 模式下将 single session 暴露给 SessionManager。
+    pub(crate) fn insert_session(&self, session: Arc<Session>) {
+        self.sessions.lock().unwrap().insert(session.id, session);
     }
 
     pub(crate) fn get_session(&self, id: u32) -> Option<Arc<Session>> {

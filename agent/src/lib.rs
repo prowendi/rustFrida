@@ -29,7 +29,8 @@ mod stalker;
 
 use crate::communication::{
     flush_cached_logs, is_cmd_frame, is_qbdi_helper_frame, log_msg, read_frame, register_stream_fd, send_complete,
-    send_eval_err, send_eval_ok, send_hello, shutdown_stream, start_log_writer, write_stream, GLOBAL_STREAM,
+    send_eval_err, send_eval_ok, send_hello, send_rpc_err, send_rpc_ok, shutdown_stream, start_log_writer,
+    write_stream, GLOBAL_STREAM,
 };
 use crate::crash_handler::{install_crash_handlers, install_panic_hook};
 use libc::{kill, pid_t, SIGSTOP};
@@ -180,21 +181,60 @@ pub extern "C" fn hello_entry(args_ptr: *mut c_void) -> *mut c_void {
     null_mut()
 }
 
-/// 执行 JS 脚本并通过 EVAL:/EVAL_ERR: 协议返回结果。
-/// loadjs 和 jseval 共用此逻辑。
+/// 解析 loadjs 命令的 payload（已去掉 "loadjs " 前缀的部分），
+/// 识别可选的 `[filename]\n<script>` 头部，返回 (filename, script)。
+///
+/// 格式规则:
+///   `[name]\n<script>`  → filename = "name"，script = <script>（首行即 line 1）
+///   `[name]`            → filename = "name"，script 为空
+///   其他               → filename = ""（表示 <eval>），script = 原 payload
+///
+/// filename 必须不含换行/方括号；否则不识别为 filename。
 #[cfg(feature = "quickjs")]
-fn eval_and_respond(script: &str, empty_err: &[u8]) {
+fn parse_loadjs_payload(payload: &str) -> (&str, &str) {
+    if !payload.starts_with('[') {
+        return ("", payload);
+    }
+    // 在首行内（遇到 \n 之前）找 `]`
+    let first_line_end = payload.find('\n').unwrap_or(payload.len());
+    let first_line = &payload[..first_line_end];
+    if !first_line.ends_with(']') {
+        return ("", payload);
+    }
+    let filename = &first_line[1..first_line.len() - 1];
+    if filename.is_empty() || filename.contains('[') || filename.contains(']') {
+        return ("", payload);
+    }
+    // 跳过分隔的 \n（如果存在）
+    let script_start = if first_line_end < payload.len() {
+        first_line_end + 1 // skip '\n'
+    } else {
+        payload.len()
+    };
+    (filename, &payload[script_start..])
+}
+
+/// 执行 JS 脚本并通过 EVAL/EVAL_ERR 协议返回结果。
+/// loadjs 和 jseval 共用此逻辑。
+///
+/// `filename` 用于 QuickJS 报错时显示真实来源文件（如 `script.js:5:12`）。
+/// 传空字符串时退化为 `<eval>`。
+#[cfg(feature = "quickjs")]
+fn eval_and_respond(script: &str, filename: &str, empty_err: &[u8]) {
     if script.is_empty() {
         send_eval_err(std::str::from_utf8(empty_err).unwrap_or("[quickjs] empty script"));
     } else if !quickjs_loader::is_initialized() {
         send_eval_err("[quickjs] JS 引擎未初始化，请先执行 jsinit");
     } else {
-        match quickjs_loader::execute_script(script) {
+        let result = if filename.is_empty() {
+            quickjs_loader::execute_script(script)
+        } else {
+            quickjs_loader::execute_script_with_filename(script, filename)
+        };
+        match result {
             Ok(result) => send_eval_ok(&result),
-            Err(e) => {
-                let e = e.replace('\n', "\r");
-                send_eval_err(&e);
-            }
+            // 错误直接透传（包含 \n 换行），host 侧用 println! 显示多行
+            Err(e) => send_eval_err(&e),
         }
     }
 }
@@ -267,13 +307,54 @@ fn process_cmd(command: &str) {
         },
         #[cfg(feature = "quickjs")]
         Some("loadjs") => {
-            let script = command.strip_prefix("loadjs").unwrap_or("").trim();
-            eval_and_respond(script, b"EVAL_ERR:[quickjs] Error: empty script\n");
+            // 支持两种格式:
+            //   loadjs <script>                      — 匿名脚本，错误定位 <eval>
+            //   loadjs [filename]\n<script>          — 带文件名，错误显示 filename:line:col
+            //
+            // 注意: 只 strip "loadjs" + 紧跟的一个分隔符（空格或换行），
+            // 不做 .trim()，以保留脚本的首行换行，避免 QuickJS 行号偏移。
+            let rest = command
+                .strip_prefix("loadjs ")
+                .or_else(|| command.strip_prefix("loadjs\n"))
+                .or_else(|| command.strip_prefix("loadjs"))
+                .unwrap_or("");
+            let (filename, script) = parse_loadjs_payload(rest);
+            eval_and_respond(script, filename, b"[quickjs] Error: empty script");
         }
         #[cfg(feature = "quickjs")]
         Some("jseval") => {
-            let expr = command.strip_prefix("jseval").unwrap_or("").trim();
-            eval_and_respond(expr, "EVAL_ERR:[quickjs] 用法: jseval <expression>\n".as_bytes());
+            // jseval 是 REPL 单行表达式，不支持 filename 前缀
+            let expr = command
+                .strip_prefix("jseval ")
+                .or_else(|| command.strip_prefix("jseval"))
+                .unwrap_or("")
+                .trim();
+            eval_and_respond(expr, "", "[quickjs] 用法: jseval <expression>".as_bytes());
+        }
+        // rpccall <method> <args_json>
+        //   method    — 注册在 rpc.exports 上的函数名
+        //   args_json — 参数 JSON 数组字符串，可省略（等价空数组）
+        //
+        // 回复走独立的 RPC 帧 (FRAME_KIND_RPC_OK/ERR)，与 REPL eval_state 解耦，
+        // 避免 HTTP RPC 与交互式命令互相抢占同一个响应通道。
+        #[cfg(feature = "quickjs")]
+        Some("rpccall") => {
+            let rest = command.strip_prefix("rpccall").unwrap_or("").trim_start();
+            if rest.is_empty() {
+                send_rpc_err("rpccall: 缺少 method 参数");
+            } else if !quickjs_loader::is_initialized() {
+                send_rpc_err("JS 引擎未初始化，请先执行 jsinit");
+            } else {
+                // 第一个空白前为 method，其余为 args_json（可为空）
+                let (method, args_json) = match rest.split_once(char::is_whitespace) {
+                    Some((m, a)) => (m, a.trim()),
+                    None => (rest, ""),
+                };
+                match quickjs_hook::dispatch_rpc(method, args_json) {
+                    Ok(result) => send_rpc_ok(&result),
+                    Err(e) => send_rpc_err(&e),
+                }
+            }
         }
         #[cfg(feature = "quickjs")]
         Some("jscomplete") => {

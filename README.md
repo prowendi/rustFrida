@@ -98,6 +98,105 @@ exit                # 退出
 
 ---
 
+## HTTP RPC 远程调用
+
+脚本里用 Frida 风格的 `rpc.exports` 注册方法，host 端通过 HTTP POST 调用，返回值会 `JSON.stringify` 后透传回来。适合把 agent 当成一个常驻服务用——UI、自动化脚本、测试框架都可以直接 `curl` 触发。
+
+### 启动
+
+在 legacy 单会话或 `--server` 多会话模式下，加上 `--rpc-port` 即可启动 HTTP 服务器。参数可以是纯端口号（默认绑 `0.0.0.0`），也可以是完整地址：
+
+```bash
+# legacy 模式：attach + 加载脚本 + 开 RPC 端口
+./rustfrida --pid 1234 -l rpc_test.js --rpc-port 9191
+
+# server 模式：多 session 共享同一个 RPC 端口，按 session id 路由
+./rustfrida --server --rpc-port 127.0.0.1:9191
+
+# 本机访问通过 adb forward 最简单
+adb forward tcp:9191 tcp:9191
+```
+
+### JS 侧注册
+
+```js
+// 整体替换
+rpc.exports = {
+    ping: function() { return "pong"; },
+    add: function(a, b) { return a + b; },
+    echo: function(obj) { return { received: obj, ts: Date.now() }; },
+
+    // 读取当前 App 的 package name + label
+    getAppName: function() {
+        var ActivityThread = Java.use("android.app.ActivityThread");
+        var app = ActivityThread.currentApplication();
+        var ctx = app.getApplicationContext();
+        var pm = ctx.getPackageManager();
+        return {
+            packageName: String(ctx.getPackageName()),
+            label: String(pm.getApplicationLabel(ctx.getApplicationInfo())),
+        };
+    }
+};
+
+// 或者单独追加
+rpc.export('version', function() { return "1.0.0"; });
+```
+
+`rpc.exports` 就是个普通 JS 对象，**现场 lookup，不需要向 host 注册方法列表**——你可以任意时刻增删改，下一次 HTTP 请求立刻生效。
+
+### HTTP 路由
+
+| 方法 | 路径 | Body | 说明 |
+| --- | --- | --- | --- |
+| `GET` | `/` / `/health` | — | 健康检查 |
+| `GET` | `/sessions` | — | 列出所有 session（id/pid/label/status）|
+| `POST` | `/rpc/<session>/<method>` | JSON 数组 | 调用 `rpc.exports[method].apply(null, args)`；空 body 等价 `[]` |
+
+`<session>` 在 legacy 模式下固定为 `0`，在 `--server` 模式下对应 `list` 命令显示的 id。
+
+### 调用示例
+
+```bash
+# 简单调用
+curl -X POST http://127.0.0.1:9191/rpc/0/ping
+# → {"ok":true,"result":"pong"}
+
+# 位置参数（JSON 数组）
+curl -X POST http://127.0.0.1:9191/rpc/0/add -d '[3,4]'
+# → {"ok":true,"result":7}
+
+# 对象参数
+curl -X POST http://127.0.0.1:9191/rpc/0/echo -d '[{"foo":1,"bar":"hi"}]'
+# → {"ok":true,"result":{"received":{"foo":1,"bar":"hi"},"ts":1775806588866}}
+
+# Java 集成
+curl -X POST http://127.0.0.1:9191/rpc/0/getAppName
+# → {"ok":true,"result":{"packageName":"com.android.settings","label":"设置"}}
+
+# 列出 session
+curl http://127.0.0.1:9191/sessions
+# → [{"id":0,"pid":1234,"label":"PID:1234","status":"connected"}]
+```
+
+成功响应统一是 `{"ok":true,"result":<value>}`；失败是 `{"ok":false,"error":"<msg>"}`，HTTP 状态码 400（参数错）/404（session/method 不存在）/503（session 未连接）/500（JS 异常或超时）。
+
+### 行为约束
+
+- **返回值必须 JSON-safe**：`JSON.stringify` 在 JS 侧执行，函数/循环引用/`undefined` 会被跳过或变 `null`。直接 `return` 一个 Java `{__jptr, __jclass}` wrapper 只会得到指针字面量，host 端拿不到实际对象——把要回的字段先 `String(obj.method())` 或手动构造 plain object。
+- **并发串行化**：每个 session 有一把 `rpc_lock`，并发 HTTP 请求在 session 内排队执行。agent 的 JS 引擎本来就是单线程串行的，这里只是把排队前移到 host 侧避免 `rpc_state` channel 冲突。跨 session 的调用完全并行。
+- **不占用 REPL eval 通道**：RPC 回复走独立的 `FRAME_KIND_RPC_OK/ERR` 帧，和 `jseval` / `loadjs` 的 `EVAL_OK/ERR` 并列。你可以一边在 REPL 里 `jseval`，一边在外面 `curl` 调 RPC，互不干扰。
+- **超时 30 秒**：RPC 调用默认 30s 超时，超时返回 `{"ok":false,"error":"rpc call timed out"}`。长耗时任务请在 JS 侧起异步并通过别的 RPC 查进度。
+- **同步调用**：目前不支持 Promise——`async function` 返回的 Promise 会被 `JSON.stringify` 成 `{}`。需要异步时自己管理状态并提供轮询接口。
+
+### 协议实现
+
+- **host 侧**：`rust_frida/src/http_rpc.rs`（纯 std::net，手写 HTTP/1.1 parser）→ `Session::rpc_call(method, args_json, timeout)` → `rpccall <method> <args_json>` 命令通过已有 socketpair 发给 agent。
+- **agent 侧**：`agent/src/lib.rs` 的 `rpccall` handler → `quickjs_hook::dispatch_rpc(method, args_json)` → JS 内 `__rpc_dispatch` 查 `rpc.exports[method]` → `JSON.stringify` → 通过 `FRAME_KIND_RPC_OK/ERR` 帧回复。
+- **没有新增 socket/channel**：RPC 帧类型是在已有 socketpair 上新增的 frame kind (0x85/0x86)；host 端 session 内的 `rpc_state: SyncChannel` 是进程内线程间分发器，跟 agent 通信无关。
+
+---
+
 ## JS API 参考
 
 ### 全局对象一览

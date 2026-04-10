@@ -216,7 +216,14 @@ pub fn get_or_init_engine() -> Result<(), String> {
 
 /// Load and execute a JavaScript script using the global engine.
 /// Returns the string representation of the result, or an empty string for `undefined`.
+///
+/// 等价于 `load_script_with_filename(script, "<eval>")`。
 pub fn load_script(script: &str) -> Result<String, String> {
+    load_script_with_filename(script, "<eval>")
+}
+
+/// Load + execute with an explicit filename (用于 QuickJS 报错时显示 `filename:line:col`)。
+pub fn load_script_with_filename(script: &str, filename: &str) -> Result<String, String> {
     let mut engine = JS_ENGINE
         .lock()
         .map_err(|e| format!("Failed to lock JS engine: {}", e))?;
@@ -225,13 +232,73 @@ pub fn load_script(script: &str) -> Result<String, String> {
     }
     let engine = engine.as_ref().ok_or("JS engine not initialized")?;
     let _owner_guard = JsEngineOwnerGuard::acquire();
-    let value = engine.eval(script)?;
+    let value = engine.eval_file(script, filename)?;
     engine.run_pending_jobs();
     let result = if value.is_undefined() {
         "undefined".to_string()
     } else {
         value.to_string(engine.context().as_ptr()).unwrap_or_default()
     };
+    value.free(engine.context().as_ptr());
+    Ok(result)
+}
+
+/// 将任意字符串编码成 JS 字符串字面量（带双引号），可直接拼入 JS 源码。
+fn js_string_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\x08' => out.push_str("\\b"),
+            '\x0c' => out.push_str("\\f"),
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// 调用 `rpc.exports[method]` 并返回 JSON 字符串化后的结果。
+///
+/// 使用全局 JS 引擎锁，与 REPL eval 互斥。HTTP RPC 调用应在外层用 Mutex 串行化，
+/// 防止多个并发请求竞争同一把 JS 引擎锁。
+///
+/// # 参数
+/// * `method` - 注册在 `rpc.exports` 上的方法名
+/// * `args_json` - JSON array 字符串（如 `"[1, 2, 3]"`），空字符串等价于 `"[]"`
+///
+/// # 返回
+/// * `Ok(json)` - 返回值的 JSON 字符串表示；`undefined` 返回 `"null"`
+/// * `Err(msg)` - 引擎未初始化 / 方法不存在 / JS 异常
+pub fn dispatch_rpc(method: &str, args_json: &str) -> Result<String, String> {
+    let engine = JS_ENGINE
+        .lock()
+        .map_err(|e| format!("Failed to lock JS engine: {}", e))?;
+    let engine = engine.as_ref().ok_or("JS engine not initialized")?;
+    let _owner_guard = JsEngineOwnerGuard::acquire();
+
+    // 构造 `__rpc_dispatch("method", "args_json")` 表达式。
+    let script = format!(
+        "__rpc_dispatch({}, {})",
+        js_string_literal(method),
+        js_string_literal(args_json),
+    );
+
+    let value = engine.eval(&script)?;
+    engine.run_pending_jobs();
+    let result = value
+        .to_string(engine.context().as_ptr())
+        .unwrap_or_else(|| "null".to_string());
     value.free(engine.context().as_ptr());
     Ok(result)
 }
