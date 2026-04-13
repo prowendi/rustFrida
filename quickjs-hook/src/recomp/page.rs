@@ -28,6 +28,22 @@ pub fn set_commit_handler(handler: RecompCommitHandler) {
     *COMMIT_HANDLER.lock().unwrap() = Some(handler);
 }
 
+static REVERT_HANDLER: Mutex<Option<RecompCommitHandler>> = Mutex::new(None);
+
+pub fn set_revert_handler(handler: RecompCommitHandler) {
+    *REVERT_HANDLER.lock().unwrap() = Some(handler);
+}
+
+/// 恢复 recomp 代码页上被 B 覆盖的原始指令（unhook 时调用）
+pub fn revert_slot_patch(orig_addr: usize) -> Result<(), String> {
+    let guard = REVERT_HANDLER.lock().unwrap();
+    let handler = match guard.as_ref() {
+        Some(h) => h,
+        None => return Ok(()), // 非 recomp 模式，静默返回
+    };
+    handler(orig_addr)
+}
+
 pub fn ensure_and_translate(orig_addr: usize) -> Result<usize, String> {
     let guard = HANDLER.lock().unwrap();
     let handler = match guard.as_ref() {

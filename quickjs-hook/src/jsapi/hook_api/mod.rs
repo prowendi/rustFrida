@@ -59,20 +59,34 @@ pub fn register_hook_api(ctx: &JSContext) {
     }
 }
 
+/// 移除单个 native hook: hook_remove + revert_slot_patch (stealth2)。
+/// 供 js_unhook 和 cleanup_hooks 复用。
+pub(crate) unsafe fn remove_single_hook(addr: u64, data: &registry::HookData) {
+    let remove_addr = if data.mode == StealthMode::Recomp {
+        data.recomp_addr
+    } else {
+        addr
+    };
+    ffi::hook::hook_remove(remove_addr as *mut std::ffi::c_void);
+    if data.mode == StealthMode::Recomp {
+        let _ = crate::recomp::revert_slot_patch(addr as usize);
+    }
+}
+
+/// 释放单个 hook 的 JS callback 引用。
+pub(crate) unsafe fn free_hook_callback(data: &registry::HookData) {
+    let ctx = data.ctx as *mut ffi::JSContext;
+    let callback: ffi::JSValue = std::ptr::read(data.callback_bytes.as_ptr() as *const ffi::JSValue);
+    ffi::qjs_free_value(ctx, callback);
+}
+
 /// Cleanup all hooks (call before dropping context)
 pub fn cleanup_hooks() {
     let mut guard = HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(registry) = guard.take() {
         // 第一阶段：移除所有 hook，阻止新回调触发
-        for (_addr, data) in registry.iter() {
-            let remove_addr = if data.mode == StealthMode::Recomp {
-                data.recomp_addr
-            } else {
-                *_addr
-            };
-            unsafe {
-                ffi::hook::hook_remove(remove_addr as *mut std::ffi::c_void);
-            }
+        for (addr, data) in registry.iter() {
+            unsafe { remove_single_hook(*addr, data); }
         }
         if !wait_for_in_flight_native_hook_callbacks(std::time::Duration::from_millis(200)) {
             crate::jsapi::console::output_message(&format!(
@@ -82,11 +96,7 @@ pub fn cleanup_hooks() {
         }
         // 第二阶段：安全释放 callback
         for (_addr, data) in registry {
-            unsafe {
-                let ctx = data.ctx as *mut ffi::JSContext;
-                let callback: ffi::JSValue = std::ptr::read(data.callback_bytes.as_ptr() as *const ffi::JSValue);
-                ffi::qjs_free_value(ctx, callback);
-            }
+            unsafe { free_hook_callback(&data); }
         }
     }
 }

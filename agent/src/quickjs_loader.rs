@@ -117,6 +117,7 @@ pub fn init() -> Result<(), String> {
     quickjs_hook::recomp::set_alloc_slot_handler(|addr| crate::recompiler::alloc_trampoline_slot(addr));
     quickjs_hook::recomp::set_fixup_handler(|trampoline, addr| crate::recompiler::fixup_slot_trampoline(trampoline, addr));
     quickjs_hook::recomp::set_commit_handler(|addr| crate::recompiler::commit_slot_patch(addr));
+    quickjs_hook::recomp::set_revert_handler(|addr| crate::recompiler::revert_slot_patch(addr));
 
     if let Some(output_path) = crate::OUTPUT_PATH.get() {
         set_qbdi_output_dir(output_path.clone());

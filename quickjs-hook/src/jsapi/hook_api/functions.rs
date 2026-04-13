@@ -160,31 +160,17 @@ pub(crate) unsafe extern "C" fn js_unhook(
         Err(e) => return e,
     };
 
-    // Recomp 模式下 hook_remove 要用重编译后的地址
-    let remove_addr = with_registry_mut(&HOOK_REGISTRY, |registry| {
-        registry.get(&addr).map(|d| {
-            if d.mode == StealthMode::Recomp {
-                d.recomp_addr
-            } else {
-                addr
-            }
-        })
-    })
-    .flatten()
-    .unwrap_or(addr);
-
-    let result = hook_ffi::hook_remove(remove_addr as *mut std::ffi::c_void);
-
-    if result != HOOK_OK {
-        let err_msg = hook_error_message(result);
-        return ffi::JS_ThrowInternalError(ctx, err_msg.as_ptr() as *const _);
-    }
-
     if let Some(data) = with_registry_mut(&HOOK_REGISTRY, |registry| registry.remove(&addr)) {
         if let Some(data) = data {
-            let ctx = data.ctx as *mut ffi::JSContext;
-            let callback: ffi::JSValue = std::ptr::read(data.callback_bytes.as_ptr() as *const ffi::JSValue);
-            ffi::qjs_free_value(ctx, callback);
+            super::remove_single_hook(addr, &data);
+            super::free_hook_callback(&data);
+        }
+    } else {
+        // registry 中不存在，尝试直接 hook_remove
+        let result = hook_ffi::hook_remove(addr as *mut std::ffi::c_void);
+        if result != HOOK_OK {
+            let err_msg = hook_error_message(result);
+            return ffi::JS_ThrowInternalError(ctx, err_msg.as_ptr() as *const _);
         }
     }
 

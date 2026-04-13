@@ -558,6 +558,37 @@ pub fn commit_slot_patch(orig_addr: usize) -> Result<()> {
     Ok(())
 }
 
+/// 恢复 recomp 代码页上被 B 覆盖的原始指令（unhook 时调用）。
+///
+/// commit_slot_patch 写入 B→slot，本函数做逆操作：
+/// 从 SlotInfo.orig_insn 恢复被覆盖的 4 字节原始指令，并移除 slot 记录。
+pub fn revert_slot_patch(orig_addr: usize) -> Result<()> {
+    ensure_init();
+
+    let page_size = unsafe { sysconf(_SC_PAGESIZE) as usize };
+    let orig_base = orig_addr & !(page_size - 1);
+
+    let mut guard = RECOMP_PAGES.lock().unwrap();
+    let pages = guard.as_mut().unwrap();
+
+    let page = match pages.get_mut(&orig_base) {
+        Some(p) => p,
+        None => return Ok(()), // 非 recomp 模式
+    };
+
+    let info = match page.slots.remove(&orig_addr) {
+        Some(i) => i,
+        None => return Ok(()), // 无 slot 记录
+    };
+
+    unsafe {
+        ptr::write_volatile(info.recomp_addr as *mut u32, u32::from_le_bytes(info.orig_insn));
+        hook_flush_cache(info.recomp_addr as *mut libc::c_void, 4);
+    }
+
+    Ok(())
+}
+
 /// 修复 hook engine 为 slot 自动生成的 trampoline。
 ///
 /// hook engine 的 build_trampoline 从 slot 地址读 "original bytes"（清零后是 NOP/0），

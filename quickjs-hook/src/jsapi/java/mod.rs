@@ -749,6 +749,8 @@ unsafe fn release_java_hook_resources(
             if remove_runtime_hooks {
                 if let Some(target) = per_method_hook_target {
                     hook_ffi::hook_remove(*target as *mut std::ffi::c_void);
+                    // stealth2: 恢复 recomp 代码页上的 B 指令
+                    let _ = crate::recomp::revert_slot_patch(data.original_entry_point as usize);
                 }
 
                 hook_ffi::hook_remove_redirect(data.art_method);

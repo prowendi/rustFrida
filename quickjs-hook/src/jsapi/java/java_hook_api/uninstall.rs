@@ -83,6 +83,8 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_unhook(
 
             if let Some(target) = per_method_hook_target {
                 hook_ffi::hook_remove(*target as *mut std::ffi::c_void);
+                // stealth2: hook_remove 只恢复 slot，还需恢复 recomp 代码页上的 B 指令
+                let _ = crate::recomp::revert_slot_patch(hook_data.original_entry_point as usize);
                 output_verbose(&format!("[java unhook] Step 2: Layer 3 hook 已移除: {:#x}", target));
             }
 
