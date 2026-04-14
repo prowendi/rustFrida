@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Mutex;
 
 use super::art_method::{
-    get_instrumentation_spec, read_entry_point, try_invalidate_jit_cache, ArtBridgeFunctions, ART_BRIDGE_FUNCTIONS,
+    get_instrumentation_spec, read_entry_point, ArtBridgeFunctions, ART_BRIDGE_FUNCTIONS,
 };
 use super::art_thread::{get_art_thread_spec, get_managed_stack_spec, ArtThreadSpec, ART_THREAD_SPEC};
 use super::callback::{get_replacement_method, is_replacement_method};
@@ -414,17 +414,18 @@ pub(super) fn ensure_art_controller_initialized(
     let _ = get_art_thread_spec(env as JniEnv);
     let _ = get_managed_stack_spec();
 
-    // B3: 自动清空 JIT 缓存 — 使已内联被 hook 方法的 JIT 代码失效
-    unsafe {
-        try_invalidate_jit_cache();
-    }
-
-    // 注意: DeoptimizeBootImage 和 forced_interpret_only 不再自动调用。
+    // 注意: DeoptimizeBootImage / forced_interpret_only / InvalidateAllMethods 都不自动调用。
     // Frida 中这些是可选功能 (Java.deopt())，不是 hook 安装的前置条件。
-    // 自动调用会导致所有方法走 interpreter → 进程启动极慢 → ActivityManager kill。
+    // 自动调用会:
+    //   - DeoptimizeBootImage + forced_interpret: 全局走 interpreter → 进程启动极慢 → ActivityManager kill
+    //   - InvalidateAllMethods: 清空所有 JIT 代码 → 热点方法集体重编译 → 瞬时性能降级
+    // stealth=0 的 rw-sibling 直写 + stealth=1 的 KPM + stealth=2 的 recomp PTE 重定向
+    // 已能直接 patch JIT cache ep, 不再需要提前 invalidate。
+    // 副作用: 调用者已 inline 的 hook 方法 body 不会被拦截 (Frida 同样限制),
+    // 需要完整拦截时用户显式调 Java.deopt()。
     // Hook 路由依靠:
     //   - Layer 1 (shared stub hooks) + Layer 2 (DoCall) 覆盖 interpreter 路径
-    //   - Layer 3 (per-method quickCode hook) 覆盖 compiled 路径
+    //   - Layer 3 (per-method quickCode hook) 覆盖 compiled 路径 (含 JIT cache)
     //   - install.rs 中 nterp → interpreter_bridge 降级确保 nterp 方法走 Layer 1
 
     let mut shared_stub_targets = Vec::new();
