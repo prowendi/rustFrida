@@ -4,7 +4,7 @@ use crate::jsapi::callback_util::{
     dup_callback_to_bytes, ensure_function_arg, extract_string_arg, throw_internal_error, with_registry,
     with_registry_mut,
 };
-use crate::jsapi::console::{output_message, output_verbose};
+use crate::jsapi::console::output_verbose;
 use crate::value::JSValue;
 
 use super::super::art_controller::ensure_art_controller_initialized;
@@ -274,7 +274,7 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
     } else {
         "shared_stub"
     };
-    output_message(&format!(
+    output_verbose(&format!(
         "[java hook] 完成: {}.{}{} (ArtMethod={:#x}, strategy={})",
         class_name, method_name, actual_sig, art_method, strategy
     ));

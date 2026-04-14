@@ -1,6 +1,6 @@
 use crate::ffi;
 use crate::jsapi::callback_util::{extract_string_arg, with_registry, with_registry_mut};
-use crate::jsapi::console::{output_message, output_verbose};
+use crate::jsapi::console::output_verbose;
 use crate::value::JSValue;
 
 use super::super::callback::*;
@@ -95,7 +95,7 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_unhook(
     let env_opt = get_thread_env().ok();
     super::super::free_java_hook_resources(&hook_data, env_opt);
 
-    output_message(&format!(
+    output_verbose(&format!(
         "[java unhook] 完成: {}.{}{}",
         class_name, method_name, actual_sig
     ));
