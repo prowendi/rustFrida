@@ -183,17 +183,10 @@ curl http://127.0.0.1:9191/sessions
 
 ### 行为约束
 
-- **返回值必须 JSON-safe**：`JSON.stringify` 在 JS 侧执行，函数/循环引用/`undefined` 会被跳过或变 `null`。直接 `return` 一个 Java `{__jptr, __jclass}` wrapper 只会得到指针字面量，host 端拿不到实际对象——把要回的字段先 `String(obj.method())` 或手动构造 plain object。
-- **并发串行化**：每个 session 有一把 `rpc_lock`，并发 HTTP 请求在 session 内排队执行。agent 的 JS 引擎本来就是单线程串行的，这里只是把排队前移到 host 侧避免 `rpc_state` channel 冲突。跨 session 的调用完全并行。
-- **不占用 REPL eval 通道**：RPC 回复走独立的 `FRAME_KIND_RPC_OK/ERR` 帧，和 `jseval` / `loadjs` 的 `EVAL_OK/ERR` 并列。你可以一边在 REPL 里 `jseval`，一边在外面 `curl` 调 RPC，互不干扰。
-- **超时 30 秒**：RPC 调用默认 30s 超时，超时返回 `{"ok":false,"error":"rpc call timed out"}`。长耗时任务请在 JS 侧起异步并通过别的 RPC 查进度。
-- **同步调用**：目前不支持 Promise——`async function` 返回的 Promise 会被 `JSON.stringify` 成 `{}`。需要异步时自己管理状态并提供轮询接口。
-
-### 协议实现
-
-- **host 侧**：`rust_frida/src/http_rpc.rs`（纯 std::net，手写 HTTP/1.1 parser）→ `Session::rpc_call(method, args_json, timeout)` → `rpccall <method> <args_json>` 命令通过已有 socketpair 发给 agent。
-- **agent 侧**：`agent/src/lib.rs` 的 `rpccall` handler → `quickjs_hook::dispatch_rpc(method, args_json)` → JS 内 `__rpc_dispatch` 查 `rpc.exports[method]` → `JSON.stringify` → 通过 `FRAME_KIND_RPC_OK/ERR` 帧回复。
-- **没有新增 socket/channel**：RPC 帧类型是在已有 socketpair 上新增的 frame kind (0x85/0x86)；host 端 session 内的 `rpc_state: SyncChannel` 是进程内线程间分发器，跟 agent 通信无关。
+- **返回值必须 JSON-safe**：`JSON.stringify` 在 JS 侧执行，函数/循环引用/`undefined` 会被跳过。直接 `return` 一个 Java wrapper 只会得到指针字面量——请手动 `String(obj.method())` 或构造 plain object。
+- **并发串行化**：同一 session 内 HTTP 请求排队执行；跨 session 完全并行。
+- **超时 30 秒**：超时返回 `{"ok":false,"error":"rpc call timed out"}`。长耗时任务请改用轮询接口。
+- **仅同步**：不支持 `async` / Promise——Promise 会被 `JSON.stringify` 成 `{}`。
 
 ---
 
@@ -423,6 +416,39 @@ map.size.value;    // 读取 size 字段
 
 Spawn 模式下 app ClassLoader 未就绪，用 `Java.ready` 延迟执行。PID 注入模式下立即执行。
 
+### Java.choose 枚举存活实例（Frida 兼容）
+
+扫描 ART 堆，把目标类的所有存活实例交给 `onMatch`：
+
+```js
+Java.choose("android.app.Activity", {
+    onMatch: function(instance) {
+        console.log(instance.$className, "=>", instance.toString());
+        // return "stop";   // 提前终止
+    },
+    onComplete: function() { console.log("done"); },
+    subtypes: true,         // 包含子类（rustFrida 扩展）
+    maxCount: 1000          // 最多枚举数量，默认 16384；0 = 不限
+});
+
+// 第三参等价 subtypes（位置参数形式）
+Java.choose("java.util.List", { onMatch: fn }, true);
+```
+
+**生命周期**：传给 `onMatch` 的 wrapper **仅在 onMatch 执行期间有效**。函数返回后 `__jptr` 被置 0。若要跨回调保留实例，请在 `onMatch` 内调 `String(obj.method())` 拷字段，或自行 `NewGlobalRef`。
+
+**后端**：Android ≤13 走 `VMDebug.getInstancesOfClasses`；API 36 自动降级为堆暴力扫描。
+
+### ClassLoader 控制
+
+```js
+var loaders = Java.classLoaders();             // → 数组: app + boot + system
+Java.setClassLoader(loaders[0]);               // 切换 Java.use() 查找上下文
+var MyCls = Java.findClassWithLoader(loaders[0], "com.example.MyClass");
+```
+
+`loader` 参数接受 loader 对象、`{__jptr}` wrapper 或 `NativePointer`。Spawn 模式下 app loader 就绪前 `Java.classLoaders()` 可能只返回 boot loader，应在 `Java.ready()` 里调。
+
 ### Stealth 模式（Java hook）
 
 ```js
@@ -455,6 +481,10 @@ Java.deoptimizeMethod("com.example.Test", "foo", "(I)V");  // 单方法降级
 | `Class.method.impl = null` | — | setter |
 | `Class.method.overload(...types)` | `string...` | `MethodWrapper` |
 | `Java.ready(fn)` | `() => void` | `void` |
+| `Java.choose(cls, callbacks, subtypes?)` | `string, {onMatch,onComplete?,subtypes?,maxCount?}, bool?` | `void` |
+| `Java.classLoaders()` | — | `LoaderInfo[]` |
+| `Java.findClassWithLoader(loader, cls)` | `Loader, string` | `JavaClassWrapper` |
+| `Java.setClassLoader(loader)` | `Loader` | — |
 | `Java.deopt()` | — | `boolean` |
 | `Java.deoptimizeBootImage()` | — | `boolean` |
 | `Java.deoptimizeEverything()` | — | `boolean` |
@@ -530,23 +560,50 @@ hook(Jni.addr("RegisterNatives"), function(ctx) {
 
 ## Memory
 
+**双风格 Frida 兼容**：`Memory.readXxx(addr)` ≡ `addr.readXxx()`，所有 read/write 方法同时挂在 `Memory` 和 `NativePointer.prototype` 上。
+
+```js
+// Memory.* 风格
+var pid = Memory.readU32(ptr("0x7f1234"));
+Memory.writeU64(dst, 0xdeadbeefn);
+var cls = Memory.readCString(ptr(ctx.x1));
+
+// ptr.* 风格（推荐，支持链式）
+var p = ptr("0x7f1234");
+p.readU32();
+p.writeU64(0xdeadbeefn);
+p.add(8).readPointer().readCString();     // 解指针再读字符串
+p.add(0x10).readByteArray(32);            // → ArrayBuffer
+
+// 写入代码后刷 I-cache
+var code = Memory.alloc(16);
+code.writeU32(0xd65f03c0);                // ret
+Memory.flushCodeCache(code, 16);
+```
+
 | API | 参数 | 返回 |
 | --- | --- | --- |
-| `Memory.readU8(addr)` | `AddressLike` | `number` |
-| `Memory.readU16(addr)` | `AddressLike` | `number` |
-| `Memory.readU32(addr)` | `AddressLike` | `bigint` |
-| `Memory.readU64(addr)` | `AddressLike` | `bigint` |
-| `Memory.readPointer(addr)` | `AddressLike` | `NativePointer` |
-| `Memory.readCString(addr)` | `AddressLike` | `string` (最多 4096B) |
-| `Memory.readUtf8String(addr)` | `AddressLike` | `string` |
-| `Memory.readByteArray(addr, len)` | `AddressLike, number` | `ArrayBuffer` |
-| `Memory.writeU8(addr, value)` | `AddressLike, number` | `undefined` |
-| `Memory.writeU16(addr, value)` | `AddressLike, number` | `undefined` |
-| `Memory.writeU32(addr, value)` | `AddressLike, number` | `undefined` |
-| `Memory.writeU64(addr, value)` | `AddressLike, bigint` | `undefined` |
-| `Memory.writePointer(addr, value)` | `AddressLike, AddressLike` | `undefined` |
+| **读** | | |
+| `Memory.readU8/U16(addr)` / `p.readU8/U16()` | `AddressLike` | `number` |
+| `Memory.readU32/U64(addr)` / `p.readU32/U64()` | `AddressLike` | `bigint` |
+| `Memory.readPointer(addr)` / `p.readPointer()` | `AddressLike` | `NativePointer` |
+| `Memory.readCString(addr)` / `p.readCString()` | `AddressLike` | `string` (最多 4096B) |
+| `Memory.readUtf8String(addr)` / `p.readUtf8String()` | `AddressLike` | `string` |
+| `Memory.readByteArray(addr, len)` / `p.readByteArray(len)` | `AddressLike, number` | `ArrayBuffer` (≤1GB) |
+| **写** | | |
+| `Memory.writeU8/U16/U32(addr, v)` / `p.writeU8/U16/U32(v)` | `AddressLike, number` | `undefined` |
+| `Memory.writeU64(addr, v)` / `p.writeU64(v)` | `AddressLike, bigint` | `undefined` |
+| `Memory.writePointer(addr, v)` / `p.writePointer(v)` | `AddressLike, AddressLike` | `undefined` |
+| **分配 / 维护** | | |
+| `Memory.alloc(size)` | `number` (≤ 256MB) | `NativePointer` (RWX, 零初始化) |
+| `Memory.allocUtf8String(s)` | `string` | `NativePointer` (RWX，末尾 `\0`) |
+| `Memory.flushCodeCache(addr, size)` | `AddressLike, number` | `undefined` |
 
-无效地址抛 `RangeError`，不会崩进程。
+**约束**：
+- 无效地址抛 `RangeError`，不会崩进程；`readCString` 超过 4096B 也抛
+- `Memory.alloc` 是 RWX 堆内存，JS 上下文销毁时自动释放；勿 `munmap`
+- 写入可执行代码后**必须**调 `Memory.flushCodeCache` 刷 ARM64 I-cache（DC CVAU + IC IVAU + ISB），否则 CPU 可能执行到 stale 指令
+- `writeXxx` 自动 mprotect 目标页为 RW，写完还原；只读段也能写
 
 ## Module
 
@@ -561,28 +618,28 @@ hook(Jni.addr("RegisterNatives"), function(ctx) {
 
 ```js
 var p = ptr("0x7f12345678");   // hex string / number / BigInt / NativePointer
-p.add(0x100)                   // → NativePointer
-p.sub(offset)                  // → NativePointer
-p.toString()                   // → "0x7f12345678"
+p.add(0x100).sub(0x10);        // 算术，返回新 NativePointer
+p.toString();                  // → "0x7f12345678"
+p.toInt();                     // → bigint (等价 toNumber)
 
-// Frida 兼容：所有 Memory 读写方法也挂在 NativePointer 上
-p.readU32()                    // 等价 Memory.readU32(p)
-p.writeU64(0xdeadbeefn)        // 等价 Memory.writeU64(p, 0xdeadbeefn)
-p.readCString()                // 等价 Memory.readCString(p)
-p.add(8).readPointer()         // 链式
+// Frida 兼容读写（完整 API 见上面 Memory 章节）
+p.readU32();                   // 等价 Memory.readU32(p)
+p.writeU64(0xdeadbeefn);       // 自动 mprotect
+p.readPointer().readCString(); // 链式解引用
 ```
 
 | API | 参数 | 返回 |
 | --- | --- | --- |
 | `ptr(value)` | `number \| bigint \| string \| NativePointer` | `NativePointer` |
-| `p.add(offset)` | `AddressLike` | `NativePointer` |
-| `p.sub(offset)` | `AddressLike` | `NativePointer` |
-| `p.toString()` | — | `string` |
-| `p.toNumber()` | — | `bigint` |
+| `p.add(offset)` / `p.sub(offset)` | `AddressLike` | `NativePointer` |
+| `p.toString()` / `p.toJSON()` | — | `string` (`"0x..."`) |
+| `p.toNumber()` / `p.toInt()` | — | `bigint` |
 | `p.readU8/U16/U32/U64/Pointer()` | — | `number \| bigint \| NativePointer` |
-| `p.readCString/readUtf8String()` | — | `string` |
+| `p.readCString()` / `p.readUtf8String()` | — | `string` |
 | `p.readByteArray(len)` | `number` | `ArrayBuffer` |
 | `p.writeU8/U16/U32/U64/Pointer(val)` | 值 | `undefined` |
+
+所有读写方法的语义、错误处理、i-cache 约束与 `Memory.*` 完全一致。
 
 ## console
 
@@ -632,9 +689,11 @@ Trace 文件默认输出到 `/data/data/<package>/trace_bundle.pb`，配合 qbdi
 - **Native hook 改参数/返回值：** `ctx.x0 = value` 或 `ctx.orig(newArg0, newArg1)`，`return value` 覆盖返回值
 - **Java hook 改参数/返回值：** `return ctx.orig(newArgs)` 改参数，`return value` 改返回值
 - **Java 字段访问必须用 `.value`：** `obj.field` 返回 FieldWrapper，`obj.field.value` 才是真实值
-- Spawn 模式下 Java hook 必须放在 `Java.ready(fn)` 里
+- **`Java.choose` 的 wrapper 仅在 `onMatch` 内有效**，跨回调保留需要自己提取字段值
+- Spawn 模式下 Java hook 必须放在 `Java.ready(fn)` 里（`Java.classLoaders()` / `Java.choose` 同理）
 - `Java.setStealth()` 必须在 `Java.use().impl` 之前调用
-- `callNative()` 仅支持整数/指针参数（最多 6 个）
+- `callNative()` 仅支持整数/指针参数（最多 6 个），需要浮点/任意签名用 `NativeFunction`
+- 自修改代码后需 `Memory.flushCodeCache(addr, size)` 清 I-cache
 
 ---
 
