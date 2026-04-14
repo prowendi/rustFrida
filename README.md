@@ -594,6 +594,8 @@ Memory.flushCodeCache(code, 16);
 | `Memory.writeU8/U16/U32(addr, v)` / `p.writeU8/U16/U32(v)` | `AddressLike, number` | `undefined` |
 | `Memory.writeU64(addr, v)` / `p.writeU64(v)` | `AddressLike, bigint` | `undefined` |
 | `Memory.writePointer(addr, v)` / `p.writePointer(v)` | `AddressLike, AddressLike` | `undefined` |
+| `Memory.writeBytes(addr, bytes, stealth?)` / `p.writeBytes(bytes, stealth?)` | `AddressLike, ArrayBuffer\|TypedArray\|number[], 0\|1` | `undefined` |
+| `Memory.writest(addr, bytes)` / `p.writest(bytes)` | `AddressLike, 4B 倍数指令字节` | `undefined` |
 | **分配 / 维护** | | |
 | `Memory.alloc(size)` | `number` (≤ 256MB) | `NativePointer` (RWX, 零初始化) |
 | `Memory.allocUtf8String(s)` | `string` | `NativePointer` (RWX，末尾 `\0`) |
@@ -605,6 +607,34 @@ Memory.flushCodeCache(code, 16);
 - 写入可执行代码后**必须**调 `Memory.flushCodeCache` 刷 ARM64 I-cache（DC CVAU + IC IVAU + ISB），否则 CPU 可能执行到 stale 指令
 - `writeXxx` 自动 mprotect 目标页为 RW，写完还原；只读段也能写
 
+**stealth 指令 patch（writeBytes / writest）**
+
+| 模式 | API | 机制 | read 可见? | 限制 |
+| --- | --- | --- | --- | --- |
+| 0 | `p.writeBytes(bytes, 0)` | mprotect RWX + memcpy + 恢复 | 是 | 留 mprotect 痕迹 |
+| 1 | `p.writeBytes(bytes, 1)` | 内核 wxshadow PATCH（shadow 页只对取指可见） | 否 | 只支持 r-x 页 + 单页内 |
+| 2 | `p.writest(bytes)` | recomp 副本页 slot + `arm64_relocator`；原子写 4B `B→slot`；末尾自动 `B → addr+4` fall-through | 否 | `addr` 4B 对齐；`bytes` 4B 倍数；同地址不可重复 |
+
+```js
+// stealth=1 wxshadow：把 getpid 首指令换掉, 数据读仍是原字节
+var addr = Module.findExportByName("libc.so", "getpid");
+addr.writeBytes(new Uint8Array([0x40,0x05,0x80,0xd2, 0xc0,0x03,0x5f,0xd6]), 1);
+// getpid() 现在返回 42；addr.readByteArray(8) 仍看到原始字节
+
+// stealth=2 writest：1 条原指令 → N 条用户指令（PC-relative 自动修正）
+addr.writest(new Uint8Array([
+    0x80,0x46,0x82,0x52,  // MOVZ W0, #0x1234
+    0xa0,0x79,0xb5,0x72,  // MOVK W0, #0xABCD, LSL #16
+    0xc0,0x03,0x5f,0xd6,  // RET
+]));
+// getpid() 返回 0xABCD1234；原 SO 字节完全不动
+```
+
+- **stealth=2** 首次调用会触发整页 recomp + prctl 注册（取指透明重定向到副本页），后续同页 writest/recompHook 复用该 slot 池（每页 16×4KB）
+- `writest` 的 user patch 若**不以 RET/B 结尾**，末尾自动追加 `B → addr+4` 让执行流落回原函数下一条指令
+- user patch 里的 PC-rel 指令（ADR/ADRP/BL/LDR literal/CBZ/TBZ...）由 `arm64_relocator` 改写为绝对 MOVZ/MOVK + BR 序列，slot 位置与原 addr 距离无影响
+- 内部跨指令分支（patch 里的 `B .+offset`）不保证正确，relocator 当外部分支处理 — 需要内部控制流请用绝对 MOVZ+BR
+
 ## Module
 
 | API | 参数 | 返回 |
@@ -613,6 +643,25 @@ Memory.flushCodeCache(code, 16);
 | `Module.findBaseAddress(module)` | `string` | `NativePointer \| null` |
 | `Module.findByAddress(addr)` | `AddressLike` | `ModuleInfo \| null` |
 | `Module.enumerateModules()` | — | `ModuleInfo[]` |
+| `Module.enumerateExports(name)` | `string` | `{type, name, address}[]` — `.dynsym` 里 defined + GLOBAL/WEAK，IFUNC 已解析 |
+| `Module.enumerateImports(name)` | `string` | `{type, name, slot, address}[]` — `.rela.dyn` + `.rela.plt` 外部符号，按名字 dedup，`address` 是 slot 当前值 |
+| `Module.enumerateSymbols(name)` | `string` | `{type, name, address, isGlobal, isDefined}[]` — `.symtab` ∪ `.dynsym` 并集，按 raw name dedup |
+| `Module.enumerateRanges(name, prot?)` | `string, "rwx" 风格` | `{base, size, protection, file:{path}}[]` — `prot` 槽位 `-` 为通配，如 `"r-x"` 匹配 `r-x` 和 `rwx` |
+
+```js
+// 枚举 libc 导出（实测 1473 条，与 readelf --dyn-syms 完全一致）
+Module.enumerateExports("libc.so").slice(0, 3);
+// [{type:"function", name:"__cxa_finalize", address:"0x7200f0e0a0"}, ...]
+
+// 按 protection 过滤代码段
+Module.enumerateRanges("libc.so", "r-x");
+// [{base:"0x7200eee000", size:638976, protection:"r-x", file:{path:"/apex/.../libc.so"}}]
+
+// 所有 r-x 段的 PLT import 地址
+Module.enumerateImports("libart.so").filter(i => i.type === "function");
+```
+
+全部走 ELF 直查（绕 linker namespace + IFUNC resolver），memfd-loaded 合成模块会返回空数组。
 
 ## ptr / NativePointer
 
@@ -638,8 +687,10 @@ p.readPointer().readCString(); // 链式解引用
 | `p.readCString()` / `p.readUtf8String()` | — | `string` |
 | `p.readByteArray(len)` | `number` | `ArrayBuffer` |
 | `p.writeU8/U16/U32/U64/Pointer(val)` | 值 | `undefined` |
+| `p.writeBytes(bytes, stealth?)` | `ArrayBuffer\|TypedArray\|number[], 0\|1` | `undefined` — `stealth=0` 普通写, `stealth=1` wxshadow（read 不可见）|
+| `p.writest(bytes)` | `ArrayBuffer\|TypedArray\|number[]` (4B 倍数) | `undefined` — stealth-2 slot relocator，PC-rel 自动修正 |
 
-所有读写方法的语义、错误处理、i-cache 约束与 `Memory.*` 完全一致。
+所有读写方法的语义、错误处理、i-cache 约束与 `Memory.*` 完全一致。stealth 语义见 Memory 章节的对比表。
 
 ## console
 
