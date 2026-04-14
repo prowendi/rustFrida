@@ -90,6 +90,9 @@ int arm64_install_user_patch(
     uint64_t user_src_pc,
     uint8_t* slot_buf, size_t slot_cap, uint64_t slot_pc,
     uint64_t fall_through_target,
+    uint64_t orig_page_base,
+    uint64_t recomp_page_base,
+    size_t   redirect_page_size,
     char* err_buf, size_t err_cap
 );
 

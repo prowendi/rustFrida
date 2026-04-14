@@ -28,6 +28,9 @@ void arm64_relocator_init(Arm64Relocator* r, const void* input, uint64_t input_p
     r->written_regs = 0;
     r->preserve_call_return_to_original = 0;
     r->original_call_return_pc = 0;
+    r->page_redirect_orig_base = 0;
+    r->page_redirect_new_base = 0;
+    r->page_redirect_size = 0;
 }
 
 void arm64_relocator_reset(Arm64Relocator* r, const void* input, uint64_t input_pc) {
@@ -44,6 +47,9 @@ void arm64_relocator_reset(Arm64Relocator* r, const void* input, uint64_t input_
     r->written_regs = 0;
     r->preserve_call_return_to_original = 0;
     r->original_call_return_pc = 0;
+    r->page_redirect_orig_base = 0;
+    r->page_redirect_new_base = 0;
+    r->page_redirect_size = 0;
 }
 
 void arm64_relocator_clear(Arm64Relocator* r) {
@@ -546,6 +552,49 @@ Arm64RelocResult arm64_relocator_write_one(Arm64Relocator* r) {
                          * normal relocation (best-effort; data may be overwritten). */
                         break;
                 }
+            }
+        }
+    }
+
+    /* --- Page-redirect optimization ---
+     *
+     * If caller set page_redirect_size and the branch/ADRP target falls inside
+     * [page_redirect_orig_base, page_redirect_orig_base + page_redirect_size),
+     * the original page has a 1:1 copy at page_redirect_new_base — we can emit
+     * a single direct branch/ADRP to that copy instead of a 20-byte MOVZ/BR
+     * absolute-jump stub back to the original (now-redirected) code range.
+     *
+     * Keep fall-through untouched if the writer's put_*_imm fails range
+     * (caller may relocate slot elsewhere); the normal path below still runs. */
+    if (r->page_redirect_size != 0) {
+        uint64_t tgt = r->current_info.target;
+        uint64_t orig_end = r->page_redirect_orig_base + r->page_redirect_size;
+        if (tgt >= r->page_redirect_orig_base && tgt < orig_end) {
+            uint64_t new_tgt = r->page_redirect_new_base +
+                               (tgt - r->page_redirect_orig_base);
+            switch (r->current_info.type) {
+                case ARM64_INSN_B:
+                    if (arm64_writer_put_b_imm(r->output, new_tgt) == 0)
+                        return ARM64_RELOC_OK;
+                    break;
+                case ARM64_INSN_BL:
+                    if (arm64_writer_put_bl_imm(r->output, new_tgt) == 0)
+                        return ARM64_RELOC_OK;
+                    break;
+                case ARM64_INSN_B_COND:
+                    if (arm64_writer_put_b_cond_imm(r->output, r->current_info.cond, new_tgt) == 0)
+                        return ARM64_RELOC_OK;
+                    break;
+                case ARM64_INSN_ADRP:
+                    arm64_writer_put_adrp_reg_address(r->output,
+                                                       r->current_info.dst_reg, new_tgt);
+                    return ARM64_RELOC_OK;
+                default:
+                    /* CBZ/TBZ/ADR/LDR-literal: fall through to default path below
+                     * (direct reloc works when target-dst_pc fits imm19/imm14/imm21).
+                     * Since recomp page is adjacent to slot, direct reloc usually
+                     * succeeds for these too. */
+                    break;
             }
         }
     }

@@ -737,12 +737,16 @@ static int pool_in_range(ExecPool* pool, void* target, int64_t range) {
 
 int hook_rebuild_trampoline(void* trampoline, size_t trampoline_size,
                             const void* orig_bytes, uint64_t orig_pc,
-                            void* jump_back_target) {
+                            void* jump_back_target,
+                            uint64_t orig_page_base,
+                            uint64_t recomp_page_base,
+                            size_t redirect_page_size) {
     if (!trampoline || !orig_bytes || !jump_back_target) return -1;
 
     uint32_t written_regs = 0;
     size_t relocated_size = hook_relocate_instructions(
-        orig_bytes, orig_pc, trampoline, 4, &written_regs);
+        orig_bytes, orig_pc, trampoline, 4, &written_regs,
+        orig_page_base, recomp_page_base, redirect_page_size);
 
     int jump_len = write_jump_back(
         (uint8_t*)trampoline + relocated_size,
@@ -906,7 +910,11 @@ void* hook_alloc_near_range(size_t size, void* target, int64_t max_range) {
  * writer PC.  This allows arm64_relocator_write_one() to emit label-based
  * branches (rather than absolute branches to the now-overwritten original code)
  * for any PC-relative branch whose target lies inside [src_pc, src_pc+min_bytes). */
-size_t hook_relocate_instructions(const void* src_buf, uint64_t src_pc, void* dst, size_t min_bytes, uint32_t* out_written_regs) {
+size_t hook_relocate_instructions(const void* src_buf, uint64_t src_pc, void* dst, size_t min_bytes,
+                                   uint32_t* out_written_regs,
+                                   uint64_t page_redirect_orig_base,
+                                   uint64_t page_redirect_new_base,
+                                   size_t page_redirect_size) {
     Arm64Writer w;
     Arm64Relocator r;
 
@@ -915,6 +923,11 @@ size_t hook_relocate_instructions(const void* src_buf, uint64_t src_pc, void* ds
     if (min_bytes == INSN_SIZE) {
         r.preserve_call_return_to_original = 1;
         r.original_call_return_pc = src_pc + INSN_SIZE;
+    }
+    if (page_redirect_size != 0) {
+        r.page_redirect_orig_base = page_redirect_orig_base;
+        r.page_redirect_new_base = page_redirect_new_base;
+        r.page_redirect_size = page_redirect_size;
     }
 
     /* Pre-create one label per source instruction in the hook region. */
@@ -1009,7 +1022,8 @@ int build_trampoline(HookEntry* entry) {
     size_t overwrite = entry->original_size;
     size_t relocated_size = hook_relocate_instructions(
         entry->original_bytes, (uint64_t)entry->target,
-        entry->trampoline, overwrite, &written_regs);
+        entry->trampoline, overwrite, &written_regs,
+        0, 0, 0);
 
     /* Write jump back to original code after the relocated instructions */
     void* jump_back_target = (uint8_t*)entry->target + overwrite;

@@ -122,6 +122,18 @@ typedef struct {
      * LR/quick-frame metadata stays in the original code range. */
     int preserve_call_return_to_original;
     uint64_t original_call_return_pc;
+
+    /* Page-redirect optimization (stealth2 writest / trampoline):
+     * If the current branch/ADRP target falls inside
+     *   [page_redirect_orig_base, page_redirect_orig_base + page_redirect_size)
+     * emit the instruction targeting
+     *   page_redirect_new_base + (target - page_redirect_orig_base)
+     * instead of an absolute MOVZ/BR back to the original code range.
+     * This collapses 20-byte stubs into a single 4-byte direct branch when the
+     * recomp copy of the original page is within ±128MB of the output. */
+    uint64_t page_redirect_orig_base;
+    uint64_t page_redirect_new_base;
+    size_t   page_redirect_size;
 } Arm64Relocator;
 
 /* ============================================================================

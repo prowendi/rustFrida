@@ -585,6 +585,9 @@ int arm64_install_user_patch(
     uint64_t user_src_pc,
     uint8_t* slot_buf, size_t slot_cap, uint64_t slot_pc,
     uint64_t fall_through_target,
+    uint64_t orig_page_base,
+    uint64_t recomp_page_base,
+    size_t   redirect_page_size,
     char* err_buf, size_t err_cap
 ) {
     if (user_bytes == NULL || user_len == 0 || (user_len & 3) != 0) {
@@ -601,9 +604,45 @@ int arm64_install_user_patch(
     arm64_writer_init(&w, slot_buf, slot_pc, slot_cap);
     arm64_relocator_init(&r, user_bytes, user_src_pc, &w);
 
-    int last_was_unconditional = 0;
+    /* Page-redirect: branches whose target is inside the user_src_pc's page
+     * get emitted as direct branches to recomp_page_base + offset instead of
+     * 20-byte absolute-jump stubs back to the original (prctl-redirected) code. */
+    if (redirect_page_size != 0) {
+        r.page_redirect_orig_base = orig_page_base;
+        r.page_redirect_new_base = recomp_page_base;
+        r.page_redirect_size = redirect_page_size;
+    }
 
-    while (!arm64_relocator_eoi(&r)) {
+    /* Within-region branch fixup: pre-create one writer label per source
+     * instruction so patch-internal branches (B / CBZ / TBZ / B.cond with
+     * target inside [user_src_pc, user_src_pc+user_len)) get re-emitted as
+     * label-based branches pointing into the slot instead of back to the
+     * original address. Capped at ARM64_RELOC_MAX_REGION (8) — larger patches
+     * silently fall back to external-branch semantics. */
+    int total_insns = (int)(user_len / 4);
+    int region_n = (total_insns <= ARM64_RELOC_MAX_REGION) ? total_insns : 0;
+    if (region_n > 0) {
+        r.region_end = user_src_pc + user_len;
+        r.region_label_count = region_n;
+        for (int i = 0; i < region_n; i++) {
+            r.region_labels[i].src_pc = user_src_pc + (uint64_t)(i * 4);
+            r.region_labels[i].label_id = arm64_writer_new_label_id(&w);
+        }
+    }
+
+    Arm64InsnType last_type = ARM64_INSN_UNKNOWN;
+    int insn_idx = 0;
+
+    /* Write every instruction in the user patch. We do NOT stop at the first
+     * unconditional terminator — with internal branches a mid-stream RET/B is
+     * just one exit path; subsequent instructions can be branch targets. */
+    while (insn_idx < total_insns) {
+        /* Place this instruction's label BEFORE emitting so back-refs resolve
+         * immediately; forward-refs resolve during flush. */
+        if (insn_idx < region_n) {
+            arm64_writer_put_label(&w, r.region_labels[insn_idx].label_id);
+        }
+
         int n = arm64_relocator_read_one(&r);
         if (n <= 0) break;
 
@@ -614,24 +653,20 @@ int arm64_install_user_patch(
             arm64_writer_clear(&w);
             return -1;
         }
-
-        last_was_unconditional = is_unconditional_transfer(r.current_info.type);
-        if (last_was_unconditional) {
-            /* An unconditional terminator already ends control flow — stop here.
-             * Anything past it in user_bytes would be dead code; we refuse so the
-             * caller notices rather than silently dropping bytes. */
-            if ((size_t)(r.input_cur - r.input_start) != user_len) {
-                set_err(err_buf, err_cap, "user patch has instructions after unconditional terminator");
-                arm64_relocator_clear(&r);
-                arm64_writer_clear(&w);
-                return -1;
-            }
-            break;
-        }
+        insn_idx++;
+        last_type = r.current_info.type;
     }
 
-    /* Fall-through B only if the user patch didn't terminate flow itself. */
-    if (!last_was_unconditional) {
+    /* Place labels for any instructions not reached (e.g. early EOI) so forward
+     * label references created before the loop exits are always resolvable. */
+    for (int i = insn_idx; i < region_n; i++) {
+        arm64_writer_put_label(&w, r.region_labels[i].label_id);
+    }
+
+    /* Append fall-through B only if the LAST instruction in the patch didn't
+     * terminate flow itself (RET/B/BR). User patches ending with RET don't need
+     * a fall-through; those ending with a conditional branch or plain MOV do. */
+    if (!is_unconditional_transfer(last_type)) {
         put_b_safe(&w, fall_through_target);
     }
 
