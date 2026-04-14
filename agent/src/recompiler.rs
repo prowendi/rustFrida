@@ -72,9 +72,6 @@ extern "C" {
         orig_bytes: *const u8,
         orig_pc: u64,
         jump_back_target: *mut libc::c_void,
-        orig_page_base: u64,
-        recomp_page_base: u64,
-        redirect_page_size: usize,
     ) -> i32;
 }
 
@@ -746,11 +743,6 @@ pub fn fixup_slot_trampoline(trampoline: *mut u8, orig_addr: usize) -> Result<()
         None => return Ok(()), // 无 slot 记录（非 stealth2 路径或已释放）
     };
 
-    // Page redirect: original bytes copied from recomp page, so target redirects
-    // are identity-mapped within the same page. Still provide the range so
-    // page-internal branches emit as direct B to recomp page (instead of 20B
-    // absolute jump) when the trampoline is out of direct branch range.
-    let recomp_page_base_addr = page.recomp_ptr as u64;
     let ret = unsafe {
         hook_rebuild_trampoline(
             trampoline as *mut libc::c_void,
@@ -758,9 +750,6 @@ pub fn fixup_slot_trampoline(trampoline: *mut u8, orig_addr: usize) -> Result<()
             info.orig_insn.as_ptr(),
             info.recomp_addr as u64,
             (info.recomp_addr + 4) as *mut libc::c_void,
-            recomp_page_base_addr,
-            recomp_page_base_addr,
-            PAGE_SIZE,
         )
     };
 

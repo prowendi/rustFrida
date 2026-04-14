@@ -161,19 +161,10 @@ int hook_register_pool(void* base, size_t size);
 /* 重建 trampoline: 将 orig_bytes (4字节) 从 orig_pc 重定位到 trampoline，
  * 然后追加绝对跳转到 jump_back_target。
  * 用途: stealth2 slot 模式下修复 hook engine 自动生成的错误 trampoline。
- *
- * Optional page-redirect: if redirect_page_size != 0, any relocated branch
- * whose target falls in [orig_page_base, orig_page_base + redirect_page_size)
- * is emitted as a direct branch to recomp_page_base + offset instead of a
- * 20-byte absolute-jump stub. Pass 0/0/0 to disable.
- *
  * 返回 trampoline 写入的总字节数，<0 失败。 */
 int hook_rebuild_trampoline(void* trampoline, size_t trampoline_size,
                             const void* orig_bytes, uint64_t orig_pc,
-                            void* jump_back_target,
-                            uint64_t orig_page_base,
-                            uint64_t recomp_page_base,
-                            size_t redirect_page_size);
+                            void* jump_back_target);
 
 /* Allocate from any pool (legacy, no locality guarantee) */
 void* hook_alloc(size_t size);
@@ -207,10 +198,7 @@ void* hook_mmap_near_range(void* target, size_t alloc_size, int64_t max_range);
  */
 size_t hook_relocate_instructions(const void* src_buf, uint64_t src_pc,
                                    void* dst, size_t min_bytes,
-                                   uint32_t* out_written_regs,
-                                   uint64_t page_redirect_orig_base,
-                                   uint64_t page_redirect_new_base,
-                                   size_t   page_redirect_size);
+                                   uint32_t* out_written_regs);
 
 /*
  * Generate an absolute jump (MOVZ/MOVK + BR, up to 20 bytes)
