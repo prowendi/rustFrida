@@ -13,6 +13,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
+#include <sys/uio.h>
 #include <unistd.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -107,6 +108,11 @@ int build_trampoline(HookEntry* entry);
  * @return              0 on success, negative error code on failure
  */
 int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry);
+
+/* 查找 target 所在 VMA 的同 inode rw-s 兄弟映射, 返回对应 writable 地址 (无则 NULL).
+ * len: 需要可写的字节数, 用于校验 sibling VMA 能容纳整段 patch (防跨 VMA memcpy SEGV).
+ * 用于 ART JIT cache dual-view patch (绕 VM_MAYWRITE). */
+void* find_rw_sibling(void* target, size_t len);
 
 /*
  * Finalize the hook: flush caches, add to hook list.

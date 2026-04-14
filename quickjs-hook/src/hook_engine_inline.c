@@ -462,12 +462,24 @@ int hook_remove(void* target) {
                 /* Stealth 1 (wxshadow): release the kernel shadow mapping.
                  * wxshadow patches CANNOT be removed via mprotect+memcpy —
                  * the shadow mapping is a kernel-level instruction-view overlay;
-                 * data-view writes do not affect it. */
+                 * data-view writes do not affect it.
+                 * 跨页 patch 有两个 shadow entry (first+second segment), 需分别 release. */
                 int rc = wxshadow_release(target);
                 if (rc != 0) {
                     hook_log("hook_remove: wxshadow_release FAILED for %p (stealth hook stays active)", target);
                     pthread_mutex_unlock(&g_engine.lock);
                     return HOOK_ERROR_WXSHADOW_FAILED;
+                }
+                uintptr_t t = (uintptr_t)target;
+                if ((t & 0xFFF) + (uintptr_t)entry->original_size > 0x1000) {
+                    size_t first_len = 0x1000 - (t & 0xFFF);
+                    void* second_addr = (void*)(t + first_len);
+                    int rc2 = wxshadow_release(second_addr);
+                    if (rc2 != 0) {
+                        hook_log("hook_remove: stealth1 second-segment release failed at %p", second_addr);
+                        /* target 首段已释放, 首指令已恢复原字节, CPU 执行回原流程.
+                         * 第二段泄漏无害: 原指令已不会执行到 (首段直接 ret 原逻辑). */
+                    }
                 }
             } else if (entry->stealth == 2) {
                 /* Stealth 2 (recomp): hook was installed via mprotect+write on recomp page.
@@ -481,15 +493,27 @@ int hook_remove(void* target) {
                 restore_page_rx(page_start);
                 hook_flush_cache(target, entry->original_size);
             } else {
-                /* Normal hook (stealth==0): restore original bytes via mprotect + memcpy */
-                uintptr_t page_start = (uintptr_t)target & ~0xFFF;
-                if (mprotect((void*)page_start, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
-                    pthread_mutex_unlock(&g_engine.lock);
-                    return HOOK_ERROR_MPROTECT_FAILED;
+                /* Normal hook (stealth==0): 优先走 rw-sibling 直写（JIT cache 走这条唯一路径）。
+                 * 对装 hook 时走 rw-sibling 的目标, mprotect 本来就 EACCES, 不切这条会导致 unhook 失败,
+                 * entry 无法 free_entry (还在链表), agent 卸载后 target 的 B 指令继续跳已释放 thunk → crash. */
+                void* writable = find_rw_sibling(target, (size_t)entry->original_size);
+                if (writable) {
+                    memcpy(writable, entry->original_bytes, entry->original_size);
+                    hook_flush_cache(target, entry->original_size);
+                    hook_log("hook_remove: rw-sibling restore OK target=%p via writable=%p len=%zu",
+                             target, writable, (size_t)entry->original_size);
+                } else {
+                    uintptr_t page_start = (uintptr_t)target & ~0xFFF;
+                    if (mprotect((void*)page_start, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+                        hook_log("hook_remove: mprotect failed target=%p errno=%d, hook remains installed",
+                                 target, errno);
+                        pthread_mutex_unlock(&g_engine.lock);
+                        return HOOK_ERROR_MPROTECT_FAILED;
+                    }
+                    memcpy(target, entry->original_bytes, entry->original_size);
+                    restore_page_rx(page_start);
+                    hook_flush_cache(target, entry->original_size);
                 }
-                memcpy(target, entry->original_bytes, entry->original_size);
-                restore_page_rx(page_start);
-                hook_flush_cache(target, entry->original_size);
             }
 
             /* Remove from hook list */

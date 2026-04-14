@@ -1020,11 +1020,90 @@ int build_trampoline(HookEntry* entry) {
     return jump_result;
 }
 
+/* 查找同 inode + offset 覆盖 target 的 rw- 兄弟映射 (ART JIT cache dual-view).
+ * 返回 target 对应的 writable 地址, 无则 NULL.
+ * len: 要写入的字节数, 用于校验整段都在兄弟 VMA 内. */
+void* find_rw_sibling(void* target, size_t len) {
+    FILE* fp = fopen("/proc/self/maps", "r");
+    if (!fp) return NULL;
+
+    uintptr_t t = (uintptr_t)target;
+    uintptr_t rx_base = 0, rx_off = 0;
+    unsigned long rx_inode = 0;
+    int found_rx = 0;
+    char line[512];
+
+    int target_shared = 0;
+    uintptr_t rx_end = 0;
+
+    /* Pass 1: 找包含 target 的 VMA, 记 inode + file offset + shared 标志 */
+    while (fgets(line, sizeof(line), fp)) {
+        uintptr_t start, end;
+        unsigned long off, inode;
+        char perms[8];
+        int n = sscanf(line, "%lx-%lx %7s %lx %*x:%*x %lu",
+                       &start, &end, perms, &off, &inode);
+        if (n == 5 && t >= start && t < end && inode != 0) {
+            rx_base = start;
+            rx_end = end;
+            rx_off = off;
+            rx_inode = inode;
+            target_shared = (perms[3] == 's');
+            found_rx = 1;
+            break;
+        }
+    }
+    if (!found_rx) {
+        fclose(fp);
+        return NULL;
+    }
+
+    /* 只对 shared 映射启用 rw-sibling 直写:
+     * private 映射的 rw 段 (如 .data) 是独立 CoW 物理页, 写入不影响 r-x 段。
+     * shared 映射 (如 ART JIT cache dual-view memfd) 两侧共享物理页, 才可直写。 */
+    if (!target_shared) {
+        fclose(fp);
+        return NULL;
+    }
+
+    /* target..target+len 必须全部在当前 VMA 内 (跨 VMA memcpy 会 SEGV 或写错数据) */
+    if (t + len > rx_end) {
+        fclose(fp);
+        return NULL;
+    }
+
+    uintptr_t file_off = rx_off + (t - rx_base);
+
+    /* Pass 2: 找同 inode 且 perms='w' + 's' (shared write) 的 VMA, 覆盖 file_off */
+    rewind(fp);
+    void* result = NULL;
+    while (fgets(line, sizeof(line), fp)) {
+        uintptr_t start, end;
+        unsigned long off, inode;
+        char perms[8];
+        int n = sscanf(line, "%lx-%lx %7s %lx %*x:%*x %lu",
+                       &start, &end, perms, &off, &inode);
+        if (n != 5) continue;
+        if (inode != rx_inode) continue;
+        if (perms[1] != 'w') continue;
+        if (perms[3] != 's') continue;
+        uintptr_t v_file_start = off;
+        uintptr_t v_file_end = off + (end - start);
+        /* 整段 patch 都要在兄弟 VMA 内 */
+        if (file_off >= v_file_start && file_off + len <= v_file_end) {
+            result = (void*)(start + (file_off - off));
+            break;
+        }
+    }
+    fclose(fp);
+    return result;
+}
+
 int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
     int jump_result;
 
     if (stealth == 1) {
-        /* wxshadow 模式: 一步写入 shadow 页.
+        /* wxshadow 模式: shadow 页写入.
          * 1. aligned(32) 防止 buf 跨页 (copy_from_user_via_pte 不支持跨页)
          * 2. hook_write_jump_at 用 target 的 PC 算 ADRP，而非 buf 的栈地址，
          *    使 target↔thunk 在 ±4GB 时走 ADRP+ADD+BR (12B) 而非 MOVZ (16B) */
@@ -1033,12 +1112,45 @@ int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
         if (jump_result < 0) {
             return jump_result;
         }
-        if (wxshadow_patch(target, jump_buf, jump_result) == 0) {
+
+        uintptr_t t = (uintptr_t)target;
+        int ok = 0;
+
+        if ((t & 0xFFF) + (uintptr_t)jump_result > 0x1000) {
+            /* target 跨页: KPM copy_from_user_via_pte 单页限制. 分两段写, 顺序很关键:
+             *   1. 先写第二页 (jump 尾部): target 首指令未变, CPU 继续原流程, 安全
+             *   2. 再写第一页 (含 target 首指令 ADRP): 首指令 4B 原子写, CPU 一旦取到 ADRP
+             *      整条 jump 序列已就位 (第二页的 BR 已先写好), 无半 jump 执行窗口
+             * 失败回滚: 已写的第二页 wxshadow_release.
+             * jump_result 最多 20B (MOVZ 4×4+BR), 最多跨 2 页. */
+            size_t first_len = 0x1000 - (t & 0xFFF);
+            size_t second_len = (size_t)jump_result - first_len;
+            void* second_addr = (void*)(t + first_len);
+
+            if (wxshadow_patch(second_addr, jump_buf + first_len, second_len) != 0) {
+                hook_log("[STEALTH1] cross-page second segment failed target=%p", target);
+                return HOOK_ERROR_WXSHADOW_FAILED;
+            }
+            if (wxshadow_patch(target, jump_buf, first_len) != 0) {
+                hook_log("[STEALTH1] cross-page first segment failed target=%p, rolling back second", target);
+                wxshadow_release(second_addr);
+                return HOOK_ERROR_WXSHADOW_FAILED;
+            }
+            /* LDR literal relocate: 两页各扫一次 (shadow 页 R/X 互斥按页生效) */
+            wxshadow_relocate_same_page_ldr_literals(target, (int)first_len);
+            wxshadow_relocate_same_page_ldr_literals(second_addr, (int)second_len);
+            ok = 1;
+            hook_log("[STEALTH1] cross-page patch OK target=%p split=%zu+%zu", target, first_len, second_len);
+        } else {
+            if (wxshadow_patch(target, jump_buf, jump_result) == 0) {
+                wxshadow_relocate_same_page_ldr_literals(target, jump_result);
+                ok = 1;
+            }
+        }
+
+        if (ok) {
             entry->stealth = 1;
             entry->original_size = jump_result;
-            /* 修复同页 LDR literal livelock: wxshadow R/X 互斥下，
-             * 同页的 PC-relative literal load 会在 fetch(X) + data(R) 间死循环 */
-            wxshadow_relocate_same_page_ldr_literals(target, jump_result);
             return 0;
         }
         /* stealth1 严格模式: wxshadow 失败拒绝降级到 mprotect。
@@ -1048,9 +1160,39 @@ int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
         return HOOK_ERROR_WXSHADOW_FAILED;
     }
 
-    /* Normal mode (stealth=0): mprotect + direct write */
+    /* Normal mode (stealth=0):
+     * 先尝试找同 inode 的 rw-s 兄弟映射直写（ART JIT cache dual-view 场景）:
+     *   - 执行侧 r-xs 无 VM_MAYWRITE, mprotect/FOLL_FORCE 都不可行
+     *   - ART 自己持有同 memfd 的 rw-s 映射, 物理页共享
+     *   - 直接 memcpy 到 rw 地址, 再 flush icache 到 rx 地址
+     *   - 完全绕开 VMA 权限 / SELinux execmod / FOLL_FORCE 限制
+     * 失败 fallback 到传统 mprotect+memcpy (对普通 file-backed VMA 有效)。 */
+    uint8_t jump_buf[MIN_HOOK_SIZE] __attribute__((aligned(32)));
+    jump_result = hook_write_jump_at(jump_buf, (uint64_t)target, jump_dest);
+    if (jump_result < 0) {
+        return jump_result;
+    }
+
+    {
+        void* writable = find_rw_sibling(target, (size_t)jump_result);
+        if (writable) {
+            memcpy(writable, jump_buf, (size_t)jump_result);
+            /* flush icache 在 target 侧 (CPU 执行地址) — 虚拟地址不同但物理页同 */
+            __builtin___clear_cache((char*)target, (char*)target + jump_result);
+            __builtin___clear_cache((char*)writable, (char*)writable + jump_result);
+            entry->stealth = 0;
+            entry->original_size = jump_result;
+            hook_log("[patch_target] rw-sibling OK target=%p via writable=%p len=%d",
+                     target, writable, jump_result);
+            return 0;
+        }
+    }
+
+    /* Fallback: mprotect + direct write */
     uintptr_t page_start = (uintptr_t)target & ~0xFFF;
     if (mprotect((void*)page_start, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        hook_log("[patch_target] mprotect(RWX) %p failed errno=%d(%s)",
+                 (void*)page_start, errno, strerror(errno));
         return HOOK_ERROR_MPROTECT_FAILED;
     }
     jump_result = hook_write_jump(target, jump_dest);
