@@ -117,10 +117,12 @@ unsafe fn install_hook(
 
     let callback_bytes = dup_callback_to_bytes(ctx, callback_arg.raw());
 
-    // Recomp 模式下 hook engine 在 slot 上写 full jump (stealth=0)，
-    // alloc_trampoline_slot 只分配 slot，B 指令在 fixup+commit 后才写入。
+    // stealth=0: 普通 mprotect+memcpy
+    // stealth=1: wxshadow 影子页写
+    // stealth=2: recomp slot — slot 已 RWX 可直写, thunk 允许远距离 (slot 容纳 16/20B patch 不溢出)
     let stealth_flag = match mode {
         StealthMode::WxShadow => 1,
+        StealthMode::Recomp => 2,
         _ => 0,
     };
 
@@ -187,16 +189,19 @@ pub(crate) unsafe extern "C" fn js_unhook(
     }
 
     // registry 中不存在, 可能是:
-    //  1) writest 留下的 slot (无 HookData) — revert_slot_patch 恢复 recomp 页字节
-    //  2) 普通 stealth=0 hook 未登记但 hook engine 已 attach — hook_remove 恢复
-    // 两者都静默尝试; 只有两者都没命中才报错.
+    //  1) writest 留下的 slot (无 HookData) — try_revert_slot_patch 恢复 recomp 页字节
+    //  2) writeBytes(bytes, 1) 留下的 wxshadow patch — wxshadow_release 清 shadow 页
+    //  3) 普通 stealth=0 hook 未登记但 hook engine 已 attach — hook_remove 恢复
+    // 三路都静默尝试; 全不命中才报错.
     let slot_cleared = crate::recomp::try_revert_slot_patch(addr as usize);
+    let wxshadow_released =
+        ffi::hook::wxshadow_release(addr as *mut std::ffi::c_void) == 0;
     let hook_removed = hook_ffi::hook_remove(addr as *mut std::ffi::c_void) == HOOK_OK;
 
-    if !slot_cleared && !hook_removed {
+    if !slot_cleared && !wxshadow_released && !hook_removed {
         return ffi::JS_ThrowInternalError(
             ctx,
-            b"unhook: no hook/writest registered at address\0".as_ptr() as *const _,
+            b"unhook: no hook/writest/wxshadow patch registered at address\0".as_ptr() as *const _,
         );
     }
 
