@@ -3,9 +3,12 @@
 // ============================================================================
 
 /// Parse /proc/self/maps to find the libart.so address range and file path.
+///
+/// 只识别系统 ART：basename 精确为 `libart.so` 且落在系统路径白名单
+/// (`/apex/`、`/system/`、`/system_ext/`)，避免命中 APK 打包的同名伪装文件。
 pub(crate) fn probe_libart_range() -> (u64, u64) {
     let snapshot = ModuleSnapshot::load_current();
-    let summary = snapshot.summarize_matching_paths(|path| path.contains("libart.so"));
+    let summary = snapshot.summarize_matching_paths(is_system_libart_path);
     let found_path = summary.as_ref().map(|summary| summary.first_path.clone());
 
     let _ = LIBART_PATH.set(found_path.clone());
@@ -409,6 +412,16 @@ fn module_basename(path: &str) -> &str {
 
 fn matches_exact_module_name(path: &str, module_name: &str) -> bool {
     path.contains(module_name) && module_basename(path) == module_name
+}
+
+/// 系统 libart.so 路径白名单：basename 精确匹配 + 系统目录前缀。
+fn is_system_libart_path(path: &str) -> bool {
+    if module_basename(path) != "libart.so" {
+        return false;
+    }
+    path.starts_with("/apex/")
+        || path.starts_with("/system/")
+        || path.starts_with("/system_ext/")
 }
 
 fn matches_module_lookup_name(path: &str, module_name: &str) -> bool {
