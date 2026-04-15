@@ -177,18 +177,27 @@ pub(crate) unsafe extern "C" fn js_unhook(
         Err(e) => return e,
     };
 
-    if let Some(data) = with_registry_mut(&HOOK_REGISTRY, |registry| registry.remove(&addr)) {
-        if let Some(data) = data {
-            super::remove_single_hook(addr, &data);
-            super::free_hook_callback(&data);
-        }
-    } else {
-        // registry 中不存在，尝试直接 hook_remove
-        let result = hook_ffi::hook_remove(addr as *mut std::ffi::c_void);
-        if result != HOOK_OK {
-            let err_msg = hook_error_message(result);
-            return ffi::JS_ThrowInternalError(ctx, err_msg.as_ptr() as *const _);
-        }
+    let registry_data = with_registry_mut(&HOOK_REGISTRY, |registry| registry.remove(&addr))
+        .flatten();
+
+    if let Some(data) = registry_data {
+        super::remove_single_hook(addr, &data);
+        super::free_hook_callback(&data);
+        return JSValue::bool(true).raw();
+    }
+
+    // registry 中不存在, 可能是:
+    //  1) writest 留下的 slot (无 HookData) — revert_slot_patch 恢复 recomp 页字节
+    //  2) 普通 stealth=0 hook 未登记但 hook engine 已 attach — hook_remove 恢复
+    // 两者都静默尝试; 只有两者都没命中才报错.
+    let slot_cleared = crate::recomp::try_revert_slot_patch(addr as usize);
+    let hook_removed = hook_ffi::hook_remove(addr as *mut std::ffi::c_void) == HOOK_OK;
+
+    if !slot_cleared && !hook_removed {
+        return ffi::JS_ThrowInternalError(
+            ctx,
+            b"unhook: no hook/writest registered at address\0".as_ptr() as *const _,
+        );
     }
 
     JSValue::bool(true).raw()

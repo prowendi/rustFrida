@@ -712,6 +712,35 @@ pub fn commit_slot_patch(orig_addr: usize) -> Result<()> {
 ///
 /// commit_slot_patch 写入 B→slot，本函数做逆操作：
 /// 从 SlotInfo.orig_insn 恢复被覆盖的 4 字节原始指令，并移除 slot 记录。
+/// 同 `revert_slot_patch`, 但返回 bool: true = 有 slot 被清；false = 该地址没 slot 记录.
+/// 供 js_unhook 判断"是否真的 revert 了 writest/hook"。
+pub fn try_revert_slot_patch(orig_addr: usize) -> bool {
+    ensure_init();
+    let page_size = unsafe { sysconf(_SC_PAGESIZE) as usize };
+    let orig_base = orig_addr & !(page_size - 1);
+    let mut guard = RECOMP_PAGES.lock().unwrap();
+    let pages = match guard.as_mut() {
+        Some(p) => p,
+        None => return false,
+    };
+    let page = match pages.get_mut(&orig_base) {
+        Some(p) => p,
+        None => return false,
+    };
+    let info = match page.slots.remove(&orig_addr) {
+        Some(i) => i,
+        None => return false,
+    };
+    unsafe {
+        ptr::write_volatile(info.recomp_addr as *mut u32, u32::from_le_bytes(info.orig_insn));
+        hook_flush_cache(info.recomp_addr as *mut libc::c_void, 4);
+    }
+    if info.reusable {
+        page.free_hook_slots.push(info.slot_addr);
+    }
+    true
+}
+
 pub fn revert_slot_patch(orig_addr: usize) -> Result<()> {
     ensure_init();
 

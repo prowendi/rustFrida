@@ -7,12 +7,14 @@ type RecompAllocSlotHandler = fn(usize) -> Result<usize, String>;
 type RecompFixupHandler = fn(*mut u8, usize) -> Result<(), String>;
 type RecompCommitHandler = fn(usize) -> Result<(), String>;
 type RecompInstallPatchHandler = fn(usize, &[u8]) -> Result<(), String>;
+type RecompTryRevertHandler = fn(usize) -> bool;
 
 static HANDLER: Mutex<Option<RecompHandler>> = Mutex::new(None);
 static ALLOC_SLOT_HANDLER: Mutex<Option<RecompAllocSlotHandler>> = Mutex::new(None);
 static FIXUP_HANDLER: Mutex<Option<RecompFixupHandler>> = Mutex::new(None);
 static COMMIT_HANDLER: Mutex<Option<RecompCommitHandler>> = Mutex::new(None);
 static INSTALL_PATCH_HANDLER: Mutex<Option<RecompInstallPatchHandler>> = Mutex::new(None);
+static TRY_REVERT_HANDLER: Mutex<Option<RecompTryRevertHandler>> = Mutex::new(None);
 
 pub fn set_handler(handler: RecompHandler) {
     *HANDLER.lock().unwrap() = Some(handler);
@@ -34,6 +36,10 @@ pub fn set_install_patch_handler(handler: RecompInstallPatchHandler) {
     *INSTALL_PATCH_HANDLER.lock().unwrap() = Some(handler);
 }
 
+pub fn set_try_revert_handler(handler: RecompTryRevertHandler) {
+    *TRY_REVERT_HANDLER.lock().unwrap() = Some(handler);
+}
+
 /// 安装 stealth-2 用户 patch：把 bytes relocate 到 recomp 跳板区 slot,
 /// 原子在 recomp 页对应位置写 B→slot, 取指命中 patch。
 pub fn install_patch(orig_addr: usize, bytes: &[u8]) -> Result<(), String> {
@@ -43,6 +49,16 @@ pub fn install_patch(orig_addr: usize, bytes: &[u8]) -> Result<(), String> {
         None => return Err("recomp install_patch handler not set".into()),
     };
     handler(orig_addr, bytes)
+}
+
+/// 尝试清除 orig_addr 处的 slot (hook 或 writest), 恢复 recomp 页字节.
+/// 返回 true = 有 slot 被清; false = 该地址没 slot 记录.
+pub fn try_revert_slot_patch(orig_addr: usize) -> bool {
+    let guard = TRY_REVERT_HANDLER.lock().unwrap();
+    match guard.as_ref() {
+        Some(h) => h(orig_addr),
+        None => false,
+    }
 }
 
 static REVERT_HANDLER: Mutex<Option<RecompCommitHandler>> = Mutex::new(None);
