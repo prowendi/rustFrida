@@ -12,7 +12,9 @@
 // Return value:
 // - primitives → JS number / boolean / BigInt (for long)
 // - String     → JS string
-// - Object/[]  → {__jptr, __jclass} wrapper (Proxy-wrapped on JS side)
+// - boxed primitives (Integer/Long/...) → JS primitive (unboxed)
+// - 数组 / List → JS Array（元素递归转换：基础类型 unbox，复杂对象保留 wrapper）
+// - 其他 Object → {__jptr, __jclass} wrapper (Proxy-wrapped on JS side)
 pub(super) unsafe extern "C" fn js_java_invoke_method(
     ctx: *mut ffi::JSContext,
     _this: ffi::JSValue,
@@ -152,9 +154,6 @@ pub(super) unsafe extern "C" fn js_java_invoke_method(
             class_name, method_name, method_sig
         )
     };
-
-    // 用户直接调用方法: 跳过容器类型转换（List→Array）
-    set_skip_container_conversion(true);
 
     // Dispatch based on return type using CallNonvirtual*MethodA (avoids needing all Call*MethodA indices)
     let result = match return_type {
@@ -326,7 +325,6 @@ pub(super) unsafe extern "C" fn js_java_invoke_method(
         _ => ffi::qjs_undefined(),
     };
 
-    set_skip_container_conversion(false);
     cleanup_local_refs(env, local_obj, cls);
     result
 }
@@ -460,8 +458,6 @@ pub(super) unsafe extern "C" fn js_java_invoke_static_method(
             class_name, method_name, method_sig
         )
     };
-
-    set_skip_container_conversion(true);
 
     let result = match return_type {
         b'V' => {
@@ -680,7 +676,6 @@ pub(super) unsafe extern "C" fn js_java_invoke_static_method(
         return cleanup_and_throw_internal(ctx, env, std::ptr::null_mut(), cls, invoke_exception());
     }
 
-    set_skip_container_conversion(false);
     cleanup_local_refs(env, std::ptr::null_mut(), cls);
     result
 }

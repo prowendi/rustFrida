@@ -112,6 +112,22 @@ pub(super) type PopLocalFrameFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_
 pub(super) type GetArrayLengthFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void) -> i32;
 pub(super) type GetObjectArrayElementFn =
     unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, i32) -> *mut std::ffi::c_void;
+pub(super) type GetBooleanArrayRegionFn =
+    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, i32, i32, *mut u8);
+pub(super) type GetByteArrayRegionFn =
+    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, i32, i32, *mut i8);
+pub(super) type GetCharArrayRegionFn =
+    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, i32, i32, *mut u16);
+pub(super) type GetShortArrayRegionFn =
+    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, i32, i32, *mut i16);
+pub(super) type GetIntArrayRegionFn =
+    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, i32, i32, *mut i32);
+pub(super) type GetLongArrayRegionFn =
+    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, i32, i32, *mut i64);
+pub(super) type GetFloatArrayRegionFn =
+    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, i32, i32, *mut f32);
+pub(super) type GetDoubleArrayRegionFn =
+    unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, i32, i32, *mut f64);
 pub(super) type CallObjectMethodAFn = unsafe extern "C" fn(
     JniEnv,
     *mut std::ffi::c_void,
@@ -679,6 +695,14 @@ pub(super) const JNI_GET_STRING_UTF_CHARS: usize = 169;
 pub(super) const JNI_RELEASE_STRING_UTF_CHARS: usize = 170;
 pub(super) const JNI_GET_ARRAY_LENGTH: usize = 171;
 pub(super) const JNI_GET_OBJECT_ARRAY_ELEMENT: usize = 173;
+pub(super) const JNI_GET_BOOLEAN_ARRAY_REGION: usize = 199;
+pub(super) const JNI_GET_BYTE_ARRAY_REGION: usize = 200;
+pub(super) const JNI_GET_CHAR_ARRAY_REGION: usize = 201;
+pub(super) const JNI_GET_SHORT_ARRAY_REGION: usize = 202;
+pub(super) const JNI_GET_INT_ARRAY_REGION: usize = 203;
+pub(super) const JNI_GET_LONG_ARRAY_REGION: usize = 204;
+pub(super) const JNI_GET_FLOAT_ARRAY_REGION: usize = 205;
+pub(super) const JNI_GET_DOUBLE_ARRAY_REGION: usize = 206;
 pub(super) const JNI_EXCEPTION_CHECK: usize = 228;
 pub(super) const JNI_NEW_OBJECT_A: usize = 30;
 
