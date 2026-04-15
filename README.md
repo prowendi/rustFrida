@@ -607,13 +607,20 @@ Memory.flushCodeCache(code, 16);
 - 写入可执行代码后**必须**调 `Memory.flushCodeCache` 刷 ARM64 I-cache（DC CVAU + IC IVAU + ISB），否则 CPU 可能执行到 stale 指令
 - `writeXxx` 自动 mprotect 目标页为 RW，写完还原；只读段也能写
 
-**writeBytes / writest — 两种写入语义**
+**writeBytes / writest — 三种写入场景**
 
-| API | 语义 | read 可见? | 长度 | 地址 |
-| --- | --- | --- | --- | --- |
-| `p.writeBytes(bytes, 0)` 或省略 | **直接覆盖** N 字节 | 可见 | 任意字节数 | 任意 |
-| `p.writeBytes(bytes, 1)` | **直接覆盖** N 字节（wxshadow 隐身） | 不可见 | <4KB（单页内） | r-x 页 |
-| `p.writest(bytes)` | **1 条指令 → N 条指令替换** | 不可见 | 任意（4B 倍数指令流） | 4B 对齐，同地址不可重装 |
+| API | 语义 | 用途 | read 可见? | 长度 | 适用段 |
+| --- | --- | --- | --- | --- | --- |
+| `p.writeBytes(bytes, 0)` 或省略 | **直接覆盖** N 字节 | 改数据/结构体/字符串 | 可见 | 任意 | **任意段**（自动 mprotect） |
+| `p.writeBytes(bytes, 1)` | **直接覆盖** N 字节 + wxshadow 隐身 | **patch 代码指令**（短） | 不可见 | <4KB | **仅 r-x 段** |
+| `p.writest(bytes)` | **1 条指令 → N 条指令替换** + recomp 隐身 | **patch 代码指令**（任意长 + PC-rel 安全） | 不可见 | 任意（4B 倍数指令流） | **仅 r-x 段** |
+
+**两种"隐身"机制**都是专门给**代码指令 patch** 用的：
+
+- `writeBytes(bytes, 1)`：走内核 `wxshadow PATCH`——为目标页创建一个 shadow 页，shadow 只对 CPU 取指可见，数据读仍返回原页字节。**只支持 r-x 代码页**，rw- 数据段会被 kernel 拒（`rc=-8`）。
+- `writest`：基于 recomp 副本页——整页 1:1 复制一份，通过 prctl 注册把 CPU 取指透明重定向到副本页，原页完全不动。**只对 r-x 代码段有效**（数据段没有指令流，不会被 recomp；强行 writest 会报 "页未重编译" 等错误）。
+
+**如果想改数据段字节**（结构体、flag、字符串），**只有 `writeBytes(bytes, 0)`**（普通 mprotect 路径）—— 其他两个只能 patch 代码。
 
 **关键区别**：
 
@@ -655,9 +662,12 @@ addr.writest(new Uint8Array([
 - `unhook(addr)` 会还原 writest 留下的 patch（和 hook 共用同一个入口）
 
 **什么时候用哪个**：
-- 想原地修改任意字节、结构体字段、字符串、数据表 → `writeBytes`
-- 想把一条指令替换为自己写的指令块（包括 PC-relative 控制流）→ `writest`
-- 想保留原指令 + 插入 callback 逻辑 → `hook(addr, fn, 2)` + `ctx.callOriginal()`
+- 想原地修改任意字节、结构体字段、字符串、数据表 → `writeBytes(bytes, 0)`（唯一能写数据段的）
+- 想**短指令 patch 且不暴露**（V-OS 反检测、代码完整性校验绕过）→ `writeBytes(bytes, 1)`（wxshadow，单页内）
+- 想**任意长度指令 patch**（含 PC-relative / 内部分支） → `writest(bytes)`（recomp）
+- 想**保留原指令 + 插入 callback 逻辑** → `hook(addr, fn, 2)` + `ctx.callOriginal()`
+
+`writeBytes(bytes, 1)` 和 `writest(bytes)` **都只能写 r-x 代码段**—— 两者是同一用途（隐身 patch 指令）的两种粒度：短直覆盖 vs 指令级替换 + PC-rel 自动修正。数据段 patch 只能用 `writeBytes(bytes, 0)`。
 
 ## Module
 
