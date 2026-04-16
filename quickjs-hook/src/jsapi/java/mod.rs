@@ -848,55 +848,68 @@ pub fn cleanup_java_hooks() {
         hook_ffi::hook_art_router_table_dump();
     }
 
-    // ART router table 推迟到最后清空 (cleanup_art_controller 之后, OAT patch
-    // revert 的同一阶段)。原本在这里先清 → 让 OAT inline patch 的
-    // is_replacement_in_table 立刻返回 0 → bypass 失效 → 在 in-flight 线程
-    // 栈上还有 thunk PC frame 时, 任意 WalkStack → StackMap 查找失败 → abort.
-    // 延后到 OAT patch 也移除的阶段, 这段时间继续让 bypass 工作, 覆盖更多
-    // 在途线程。
-
     // ============================================================
-    // Pass 1: 恢复所有 ArtMethod 字段 + 删除 replacedMethods 映射
+    // Phase 1 - 切断入口: unpatch per-method hook 字节 + 恢复 ArtMethod 字段
     //
-    // 【必须在移除 Layer 1 hooks 之前完成】
-    // 否则: Layer 1 hook 移除后原始 trampoline 恢复，但 ArtMethod 仍然是
-    // native+data_=our_thunk → 其他线程调用 → jni_trampoline → 我们的 thunk
-    // → callback 找不到 registry → 返回 x0=JNIEnv* 作为返回值 → 崩溃
+    // 目的: 新 caller 立即走原方法, 不再进入我们的 thunk, in-flight 计数只减不增.
+    // 这是 drain+verify 策略的前提.
+    //
+    // 顺序: per-method hook 字节先 unpatch (原子 4B 写, 立即生效),
+    // 再恢复 ArtMethod 字段. 这样 Layer 3 和 Layer 1/2 两条路径都被切断.
     // ============================================================
     {
         let guard = JAVA_HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(registry) = guard.as_ref() {
             for (_art_method, data) in registry.iter() {
                 unsafe {
+                    // 1a: unpatch per-method hook 首字节 → 新 caller 立即走原方法
+                    remove_per_method_hook(data);
+                    // 1b: 恢复 ArtMethod 字段 (Layer 1/2 路由也切断)
                     restore_art_method_fields(data);
-                    callback::delete_replacement_method(data.art_method);
+                    // 1c: router 表条目保留 → OAT bypass 对 in-flight 仍生效
+                    //     router 表清空放到 Phase 3 之后
                 }
             }
         }
-    } // guard dropped — 释放锁让 in-flight callback 能获取锁并安全退出
+    } // guard dropped
 
-    // 等待已进入 thunk 的回调自然退出。
-    // ArtMethod 已恢复后不会再有新回调进入，因此这里等待 in-flight 计数清零即可。
-    if !wait_for_in_flight_java_hook_callbacks(std::time::Duration::from_millis(200)) {
+    // ============================================================
+    // Phase 2 - Drain: 等待 in-flight callback 全部退出
+    //
+    // Phase 1 已切断新 caller 入口, in-flight counter 只减不增, 必然归 0.
+    // 5s 超时覆盖 JS callback 执行 (毫秒级) + 调度抖动 + hunter 类应用的
+    // 高频场景. 此时 OAT bypass + router 表仍完好, 保护 in-flight 线程栈.
+    // ============================================================
+    if !wait_for_in_flight_java_hook_callbacks(std::time::Duration::from_millis(5000)) {
         output_verbose(&format!(
-            "[java cleanup] 等待 in-flight callbacks 超时，remaining={}",
+            "[java cleanup] drain 超时 (5s), remaining={} (继续但可能崩)",
             in_flight_java_hook_callbacks()
         ));
     }
 
-    // 移除 artController 全局 hook (Layer 1/2/GC) + OAT inline patch
-    // 此时 ArtMethod 已全部恢复，移除 Layer 1 hook 后不会有线程进入 thunk。
+    // ============================================================
+    // Phase 3 - 安全移除: 此时无 in-flight, revert OAT patch / Layer 1 hook 安全
+    // ============================================================
     art_controller::cleanup_art_controller();
 
-    // 现在 OAT patch 已 revert, bypass 代码不再被 libart 调用, 清空 router 表
-    // 已无实际影响 (也避免 stale 指针在未来误匹配)
+    // router 表最后清 (此时 OAT patch 已 revert, bypass 路径不再走)
     unsafe {
         hook_ffi::hook_art_router_table_clear();
     }
 
     // ============================================================
-    // Pass 2: 移除 per-method hooks + 释放资源
+    // Phase 4 - 释放资源: delete_replacement_method + native trampoline + 资源
     // ============================================================
+    {
+        let guard = JAVA_HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(registry) = guard.as_ref() {
+            for (_art_method, data) in registry.iter() {
+                unsafe {
+                    callback::delete_replacement_method(data.art_method);
+                }
+            }
+        }
+    }
 
     let env_opt = unsafe { get_thread_env().ok() };
     let _js_guard = crate::JS_ENGINE.try_lock();
@@ -905,7 +918,6 @@ pub fn cleanup_java_hooks() {
     if let Some(registry) = guard.take() {
         for (_art_method, data) in registry {
             unsafe {
-                remove_per_method_hook(&data);
                 remove_native_trampoline(&data);
                 free_java_hook_resources(&data, env_opt);
             }
