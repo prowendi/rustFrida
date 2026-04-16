@@ -110,33 +110,34 @@ void hook_engine_cleanup(void) {
     /* HookEntry lifetime note:
      * All HookEntry structs (including trampoline and thunk memory) live in one of
      * two executable pool regions:
-     *   1. 初始 pool (exec_mem)  — 由 Rust 侧 ExecMemory 拥有，调用方负责 munmap
-     *   2. 扩展 pool (pools[])   — 由 create_pool_near_range_sized 经 mmap 创建，
-     *                              本次 cleanup 负责 munmap，否则会作为隐藏 VMA
-     *                              残留进程地址空间（wwb_hook_pool，KPM 隐藏）
+     *   1. 初始 pool (exec_mem)  — 由 Rust 侧 ExecMemory 拥有，进程生命周期保留
+     *   2. 扩展 pool (pools[])   — 由 create_pool_near_range_sized 经 mmap 创建
      *
-     * WARNING: Do NOT add malloc()/free() fallback paths for alloc_entry(). If pool
-     * allocations ever fall back to malloc, those pointers would be invalid after a
-     * munmap and would require explicit free() here. Keep all hook memory in the pool.
+     * 扩展 pool 不再 munmap —— 对标 Frida (alloc.js freeSlice 只推回 free list,
+     * Memory.alloc 返回的页永不释放)。理由:
+     *   - 即使 wait_for_in_flight_*_hook_callbacks 归零, 线程仍可能:
+     *     a) 在 thunk 汇编尾巴 (regs restore + RET) 的几条指令窗口
+     *     b) 栈深处有 HashMap.put 之类 frame, PC 在 thunk, 但线程正在 park/sleep
+     *   - munmap 任一扩展 pool 都可能让这些线程崩溃 (pc=lr=unmapped 的典型症状)
+     *   - 放弃 munmap 换稳定性, VMA 漏直到进程退出 (KPM 隐藏 wwb_hook_pool 名字即可)
      *
-     * 调用方必须已 wait_for_in_flight_*_hook_callbacks，否则 munmap 时可能有线程
-     * 仍在 trampoline 内执行 → SIGSEGV。 */
+     * WARNING: Do NOT add malloc()/free() fallback paths for alloc_entry(). */
 
-    /* 释放所有扩展 pool（保留初始 exec_mem 由调用方处理） */
-    int freed_pools = 0;
-    size_t freed_bytes = 0;
+    /* 不 munmap 扩展 pool, 只记录内存量作诊断. VMA 漏到进程退出, 新 init 分新 pool. */
+    size_t retained_bytes = 0;
+    int retained_pools = 0;
     for (int i = 0; i < g_engine.pool_count; i++) {
         if (g_engine.pools[i].base && g_engine.pools[i].size) {
-            munmap(g_engine.pools[i].base, g_engine.pools[i].size);
-            freed_bytes += g_engine.pools[i].size;
-            freed_pools++;
+            retained_bytes += g_engine.pools[i].size;
+            retained_pools++;
         }
         g_engine.pools[i].base = NULL;
         g_engine.pools[i].size = 0;
         g_engine.pools[i].used = 0;
     }
-    if (freed_pools > 0) {
-        hook_log("hook_engine_cleanup: released %d pool(s), %zu bytes", freed_pools, freed_bytes);
+    if (retained_pools > 0) {
+        hook_log("hook_engine_cleanup: retained %d extension pool(s), %zu bytes (leaked until process exit, Frida-style)",
+                 retained_pools, retained_bytes);
     }
     g_engine.pool_count = 0;
 

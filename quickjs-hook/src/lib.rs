@@ -154,6 +154,9 @@ pub fn init_hook_engine(exec_mem: *mut u8, size: usize) -> Result<(), String> {
 }
 
 /// Cleanup the hook engine
+///
+/// 对标 Frida: 只 reset 内部状态, 不 munmap 扩展 pool (见 hook_engine.c 注释).
+/// 线程若还在 thunk 里执行, 代码页保留直到进程退出, 避免 SIGSEGV。
 pub fn cleanup_hook_engine() {
     unsafe {
         ffi::hook::hook_engine_cleanup();
