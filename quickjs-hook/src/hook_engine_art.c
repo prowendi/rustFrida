@@ -442,15 +442,10 @@ void* hook_install_art_router(void* target, uint32_t quickcode_offset,
     }
 
     /* Allocate thunk (router code — larger than default).
-     * stealth=1: 优先 ADRP 范围 (12B)，失败退回 hook_alloc_near (MOVZ 16~20B)。 */
+     * hook_alloc_near 按 ±128MB → ±4GB → 任意 三层分配。 */
     size_t art_thunk_alloc = 2048;
     if (!entry->thunk || entry->thunk_alloc < art_thunk_alloc) {
-        if (stealth == 1) {
-            entry->thunk = hook_alloc_near_range(art_thunk_alloc, target, (int64_t)1 << 32);
-        }
-        if (!entry->thunk) {
-            entry->thunk = hook_alloc_near(art_thunk_alloc, target);
-        }
+        entry->thunk = hook_alloc_near(art_thunk_alloc, target);
         entry->thunk_alloc = art_thunk_alloc;
     }
     if (!entry->thunk) {

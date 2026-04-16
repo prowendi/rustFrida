@@ -474,10 +474,15 @@ int hook_write_jump_at(void* dst, uint64_t exec_pc, void* target) {
     Arm64Writer w;
     arm64_writer_init(&w, dst, exec_pc, MIN_HOOK_SIZE);
 
-    /* 尝试 ADRP+ADD+BR (12 字节, ±4GB) */
     int64_t pc_rel = (int64_t)(uint64_t)target - (int64_t)exec_pc;
+    int64_t b_range = (int64_t)128 << 20;  /* ±128MB */
     int64_t adrp_range = (int64_t)1 << 32; /* ±4GB */
-    if (pc_rel > -adrp_range && pc_rel < adrp_range) {
+
+    if (pc_rel > -b_range && pc_rel < b_range && (pc_rel & 3) == 0) {
+        /* B (4 字节, ±128MB) — 最小 patch，只覆盖 1 条指令 */
+        arm64_writer_put_b_imm(&w, (uint64_t)target);
+    } else if (pc_rel > -adrp_range && pc_rel < adrp_range) {
+        /* ADRP+ADD+BR (12 字节, ±4GB) */
         arm64_writer_put_adrp_add_br(&w, ARM64_REG_X16, (uint64_t)target);
     } else {
         /* Fallback: MOVZ+MOVK+BR (16+ 字节) */
@@ -489,7 +494,7 @@ int hook_write_jump_at(void* dst, uint64_t exec_pc, void* target) {
         return HOOK_ERROR_BUFFER_TOO_SMALL;
     }
 
-    /* 不 pad BRK — 返回实际字节数 (ADRP=12, MOVZ=16)。
+    /* 不 pad BRK — 返回实际字节数 (B=4, ADRP=12, MOVZ=16)。
      * 调用方（patch_target/OAT）按返回值决定 overwrite 大小。 */
     int bytes_written = (int)arm64_writer_offset(&w);
     arm64_writer_clear(&w);
@@ -807,9 +812,39 @@ void* hook_alloc_near(size_t size, void* target) {
     if (!g_engine.initialized) return NULL;
     size = (size + 7) & ~7;
 
-    int64_t adrp_range = (int64_t)1 << 32;
+    int64_t b_range = (int64_t)128 << 20;     /* ±128MB — B 指令 4B patch */
+    int64_t adrp_range = (int64_t)1 << 32;    /* ±4GB  — ADRP 12B patch */
 
-    /* Phase 1: 遍历所有 pool（含初始 pool），找 ADRP 可达 + 有空间的 */
+    /* ── Tier 1: ±128MB (B 指令, 4B patch) ── */
+
+    /* 1a: 现有 pool 中找 ±128MB 内有空间的 */
+    if (g_engine.exec_mem_used + size <= g_engine.exec_mem_size) {
+        int64_t dist = (int64_t)((uint8_t*)g_engine.exec_mem - (uint8_t*)target);
+        if (dist > -b_range && dist < b_range) {
+            void* ptr = (uint8_t*)g_engine.exec_mem + g_engine.exec_mem_used;
+            g_engine.exec_mem_used += size;
+            return ptr;
+        }
+    }
+    for (int i = 0; i < g_engine.pool_count; i++) {
+        if (pool_in_range(&g_engine.pools[i], target, b_range)) {
+            void* ptr = alloc_from_pool(&g_engine.pools[i], size);
+            if (ptr) return ptr;
+        }
+    }
+
+    /* 1b: 现有 pool 全部不在 ±128MB 或已满 → 创建 ±128MB 新 pool */
+    {
+        ExecPool* pool = create_pool_near_range(target, b_range);
+        if (pool) {
+            void* ptr = alloc_from_pool(pool, size);
+            if (ptr) return ptr;
+        }
+    }
+
+    /* ── Tier 2: ±4GB (ADRP, 12B patch) ── */
+
+    /* 2a: 现有 pool 中找 ±4GB 内有空间的 */
     if (g_engine.exec_mem_used + size <= g_engine.exec_mem_size) {
         int64_t dist = (int64_t)((uint8_t*)g_engine.exec_mem - (uint8_t*)target);
         if (dist > -adrp_range && dist < adrp_range) {
@@ -819,24 +854,28 @@ void* hook_alloc_near(size_t size, void* target) {
         }
     }
     for (int i = 0; i < g_engine.pool_count; i++) {
-        if (pool_in_adrp_range(&g_engine.pools[i], target)) {
+        if (pool_in_range(&g_engine.pools[i], target, adrp_range)) {
             void* ptr = alloc_from_pool(&g_engine.pools[i], size);
             if (ptr) return ptr;
         }
     }
 
-    /* Phase 2: 优先用通用分配兜底（节省 pool slot 给 hook_alloc_near_range）。
-     * hook_alloc_near 不要求严格距离，MOVZ+MOVK 路径始终可用。
-     * 只在通用空间耗尽时才创建 nearby pool。 */
-    void* fallback = hook_alloc(size);
-    if (fallback) {
-        /* 即使不在 ADRP 范围也返回 — hook_write_jump 会用 MOVZ+MOVK 兜底 */
-        return fallback;
+    /* 2b: 现有 pool 全部不在 ±4GB → 创建 ±4GB 新 pool */
+    {
+        ExecPool* pool = create_pool_near_range(target, adrp_range);
+        if (pool) {
+            void* ptr = alloc_from_pool(pool, size);
+            if (ptr) return ptr;
+        }
     }
 
-    /* Phase 3: 通用空间耗尽 → 创建 nearby pool */
-    ExecPool* near_pool = create_pool_near(target);
-    return near_pool ? alloc_from_pool(near_pool, size) : NULL;
+    /* ── Tier 3: 任意距离 (MOVZ 16~20B patch) ── */
+    void* fallback = hook_alloc(size);
+    if (fallback) return fallback;
+
+    /* 所有 pool 全满且无法创建新 pool */
+    ExecPool* any_pool = create_pool_near(NULL);
+    return any_pool ? alloc_from_pool(any_pool, size) : NULL;
 }
 
 /* 在 target ±max_range 范围内分配可执行内存。

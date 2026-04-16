@@ -554,6 +554,14 @@ static int apply_oat_inline_patch(
         return -1;
     }
 
+    /* OAT inline pattern 固定 4 条指令 = 16B，覆盖超过此范围会写坏相邻代码 */
+    if (jump_len > 16) {
+        hook_log("\033[31m[oat_patch] REJECTED: jump_len=%d > 16B (oat_thunk=%p 距 patch=%#lx 过远, "
+                 "MOVZ 20B 会溢出 pattern 边界)\033[0m",
+                 jump_len, oat_thunk, (unsigned long)patch_addr);
+        return -1;
+    }
+
     int overwrite = jump_len;
 
     /* Save original bytes (always from original address) */

@@ -247,16 +247,6 @@ int hook_attach(void* target, HookCallback on_enter, HookCallback on_leave, void
     entry->on_leave = on_leave;
     entry->user_data = user_data;
 
-    /* stealth=1: 优先 ADRP 范围 (12B patch)，失败退回 hook_alloc_near (MOVZ 16~20B)。
-     * wxshadow 支持 20B patch，但 12B 对小跳板更安全。 */
-    if (stealth == 1 && (!entry->thunk || entry->thunk_alloc < THUNK_ALLOC_SIZE)) {
-        entry->thunk = hook_alloc_near_range(THUNK_ALLOC_SIZE, target, (int64_t)1 << 32);
-        if (entry->thunk) {
-            entry->thunk_alloc = THUNK_ALLOC_SIZE;
-        }
-        /* near_range 失败不 abort，generate_attach_thunk 会 fallback hook_alloc_near */
-    }
-
     if (build_trampoline(entry) < 0) {
         free_entry(entry);
         pthread_mutex_unlock(&g_engine.lock);
@@ -350,14 +340,6 @@ void* hook_replace(void* target, HookCallback on_enter, void* user_data, int ste
 
     entry->on_enter = on_enter;
     entry->user_data = user_data;
-
-    /* stealth=1: 优先 ADRP 范围 (12B)，失败退回 hook_alloc_near (MOVZ 16~20B) */
-    if (stealth == 1 && (!entry->thunk || entry->thunk_alloc < THUNK_ALLOC_SIZE)) {
-        entry->thunk = hook_alloc_near_range(THUNK_ALLOC_SIZE, target, (int64_t)1 << 32);
-        if (entry->thunk) {
-            entry->thunk_alloc = THUNK_ALLOC_SIZE;
-        }
-    }
 
     if (build_trampoline(entry) < 0) {
         free_entry(entry);
