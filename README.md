@@ -321,12 +321,6 @@ atan2(1.0, 2.0);
 
 AAPCS64 调用约定：整数/指针先填 x0-x7，浮点先填 d0-d7（两队列独立），超出部分自动压栈。不支持 struct-by-value。
 
-### Memory 堆分配
-
-```js
-var buf = Memory.alloc(128);                 // 分配 128 字节 RWX 内存 → NativePointer
-var str = Memory.allocUtf8String("hello");   // 分配并写入 UTF-8 字符串 → NativePointer
-```
 
 ### Stealth 模式
 
@@ -346,8 +340,6 @@ hook(target, callback, true)            // true = WXSHADOW
 | `unhook(target)` | `AddressLike` | `boolean` |
 | `callNative(func, ...args)` | `AddressLike, ...AddressLike` (最多6个) | `number \| bigint` |
 | `new NativeFunction(addr, retType, argTypes)` | `AddressLike, string, string[]` | `Function` (可调用，任意签名) |
-| `Memory.alloc(size)` | `number` | `NativePointer` (RWX 堆内存) |
-| `Memory.allocUtf8String(s)` | `string` | `NativePointer` |
 | `diagAllocNear(addr)` | `AddressLike` | `undefined` |
 
 ---
@@ -501,6 +493,73 @@ Java.deoptimizeMethod("com.example.Test", "foo", "(I)V");  // 单方法降级
 ```
 
 手动调用的工具函数，hook 流程不自动使用。
+
+### 类型 Marshal 规则（Java ↔ JS 自动转换）
+
+Hook 回调的 `arguments`、`$orig()` / `Class.method()` 返回值、字段 `.value` 读写、`Java.choose` 的 `onMatch` 参数都走同一套 marshal 规则。
+
+#### Java → JS（参数 / 返回值 / 字段读）
+
+**自动转换为原生 JS 值：**
+
+| Java 类型 | JNI 签名 | JS 值 | 说明 |
+| --- | --- | --- | --- |
+| `boolean` | `Z` | `boolean` | |
+| `byte` | `B` | `number` | 有符号 i8 |
+| `char` | `C` | `string` | 长度为 1 的字符串 |
+| `short` | `S` | `number` | i16 |
+| `int` | `I` | `number` | i32 |
+| `long` | `J` | `BigInt` | u64 |
+| `float` | `F` | `number` | |
+| `double` | `D` | `number` | |
+| `java.lang.String` | `Ljava/lang/String;` | `string` | 走 `GetStringUTFChars` |
+| `null` | — | `null` | |
+| Java 原始类型数组 `T[]`（T 为 Z/B/C/S/I/J/F/D）| `[T` | `Array` of 对应 JS 值 | 一次 `GetXxxArrayRegion` 批量拷贝，无装箱 |
+| Java 对象数组 `T[]` | `[LT;` / `[[...` | `Array` of wrapper / 递归 marshal | 嵌套深度上限 16 |
+
+**保留为 Java wrapper `{__jptr, __jclass}`（不自动转换，需手动处理）：**
+
+- **装箱类型 NOT unboxed**：`Integer` / `Long` / `Float` / `Double` / `Boolean` / `Byte` / `Short` / `Character` 全部返回 wrapper，**不会**自动变成 JS number/boolean。需要原始值手动转：
+  ```js
+  var n = boxed.intValue();              // Integer → int
+  var d = boxed.doubleValue();           // Double → number
+  var s = String(boxed);                 // 走 toString
+  ```
+- **容器不展开**：`List` / `Map` / `Set` / `ArrayList` / `HashMap` 等保留 wrapper，手动遍历：
+  ```js
+  var list = obj.getList();
+  for (var i = 0; i < list.size(); i++) {
+      var item = list.get(i);            // 仍是 wrapper（除非是 String）
+  }
+  var keys = map.keySet().toArray();     // → JS Array of wrappers
+  ```
+- **其他任意对象类型**：用户类、`Context`、`Activity`、`File` 等一律 wrapper，通过 `.method()` / `.field.value` 链式访问。
+
+**`$new` 强制 wrapper 特例**：`Java.use("java.lang.String").$new("hi")` 即使构造出 String 也保留为 wrapper（便于链式 `.length()` / `.charAt()`）——这是唯一跳过 String → JS string 自动转换的场景。
+
+#### JS → Java（`$orig(args)` / `Class.method(args)` / 字段写 / `$new(args)`）
+
+按目标参数的 JNI 签名 marshal：
+
+| 目标签名 | 接受的 JS 值 |
+| --- | --- |
+| `Z` | `boolean` / `number`（非零即 true）|
+| `B` / `S` / `I` / `J` | `number` / `BigInt` |
+| `C` | `string`（取首字符）/ `number` |
+| `F` / `D` | `number` |
+| `Ljava/lang/String;` 或任意 `L...;` 场景下的 JS string | → `NewStringUTF` |
+| 任意 `L...;`（已是 Java 对象）| `{__jptr}` wrapper / `Proxy` → 提取原始 jobject 指针 |
+| 装箱类型 `Ljava/lang/Integer;` 等 | JS number/boolean/bigint 走 **autobox**（JNI `Xxx.valueOf()`）|
+| 任意类型 | `null` / `undefined` → JNI null (0) |
+
+**autobox 规则**：目标签名精确匹配时按目标类型装箱（`Ljava/lang/Long;` → `Long.valueOf(J)`）；无精确签名时按 JS 值推断 —— 整数 fit i32 → `Integer`，否则 → `Double`；boolean → `Boolean`。
+
+**常见陷阱：**
+
+- 传普通 JS object（非 wrapper、无 `__jptr`）给 `L...;` 参数会 marshal 成 0 → Java 侧 NPE。
+- 传 `undefined` 等同 `null`，别依赖默认行为——显式写 `null`。
+- `Map.put(Object, Object)` 传 `number` 会被 autobox 成 `Integer` / `Double`，取出来**仍是 wrapper**，要 `.intValue()` 才能拿回 JS number。
+- JS string 会为**所有** `L...;` 目标类型创建 `java.lang.String`（即使签名是 `Ljava/lang/Object;`），不会抛类型错误。
 
 ### API 速查
 
