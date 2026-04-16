@@ -868,13 +868,15 @@ pub unsafe extern "C" fn art_router_stack_check(replacement: u64) -> i32 {
     // 避免后续 callback 在 acquire_js_engine_for_callback 等 20ms 超时 → fallback
     // invoke_original_jni 并发调 JNI, 破坏 HashMap 之类非线程安全结构的状态.
     //
-    // 当前线程如果已经持有 JS_ENGINE (reentrant, 比如 ctx.orig() 路径) 不算 busy.
+    // 用 JS_ENGINE_OWNER_THREAD atomic 检测 (callback 整个执行期间稳定):
+    //   owner == 0        → JS 空闲, 路由
+    //   owner == self     → reentrant (ctx.orig), 路由
+    //   owner == other    → 别的线程在跑 callback, 走原方法
+    // 比 try_lock + drop 更稳: 不需 acquire/release 锁, 无 race 窗口.
     let current_thread = crate::current_thread_id_u64();
-    if crate::JS_ENGINE_OWNER_THREAD.load(std::sync::atomic::Ordering::Acquire) != current_thread {
-        if crate::JS_ENGINE.try_lock().is_err() {
-            return 0; // JS busy, 走 trampoline 原方法
-        }
-        // try_lock Ok → guard 立即 drop 释放锁
+    let owner = crate::JS_ENGINE_OWNER_THREAD.load(std::sync::atomic::Ordering::Acquire);
+    if owner != 0 && owner != current_thread {
+        return 0; // JS 被别人占用, 走 trampoline 原方法
     }
 
     // TLS bypass 栈: 检查栈中是否有任何一个 entry 匹配当前 replacement 的 original
