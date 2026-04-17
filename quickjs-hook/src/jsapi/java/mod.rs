@@ -142,7 +142,9 @@ pub(crate) unsafe fn try_get_object_class(env_ptr: u64, obj_ptr: u64) -> Option<
 
     let get_object_class: GetObjectClassFn = jni_fn!(env, GetObjectClassFn, JNI_GET_OBJECT_CLASS);
     let cls = get_object_class(env, obj);
-    if cls.is_null() || jni_check_exc(env) {
+    // 注意: 用 let 提前 eager 求值 jni_check_exc，防止 `|| ` 短路漏清待定异常
+    let exc = jni_check_exc(env);
+    if cls.is_null() || exc {
         None
     } else {
         Some(cls as u64)
@@ -158,7 +160,8 @@ pub(crate) unsafe fn try_get_superclass(env_ptr: u64, cls_ptr: u64) -> Option<u6
 
     let get_superclass: GetSuperclassFn = jni_fn!(env, GetSuperclassFn, JNI_GET_SUPERCLASS);
     let super_cls = get_superclass(env, cls);
-    if super_cls.is_null() || jni_check_exc(env) {
+    let exc = jni_check_exc(env);
+    if super_cls.is_null() || exc {
         // Object / interface 的 superclass 就是 null，不是错误；清异常兜底
         None
     } else {
@@ -229,6 +232,70 @@ pub(crate) unsafe fn try_exception_occurred(env_ptr: u64) -> Option<u64> {
         None
     } else {
         Some(exc as u64)
+    }
+}
+
+pub(crate) unsafe fn try_new_string_utf(env_ptr: u64, s: &str) -> Option<u64> {
+    let env = env_ptr as JniEnv;
+    if env.is_null() {
+        return None;
+    }
+    let cstr = match std::ffi::CString::new(s) {
+        Ok(c) => c,
+        Err(_) => return None, // 嵌入 NUL 字节非法
+    };
+    let new_string_utf: NewStringUtfFn = jni_fn!(env, NewStringUtfFn, JNI_NEW_STRING_UTF);
+    let jstr = new_string_utf(env, cstr.as_ptr());
+    let exc = jni_check_exc(env);
+    if jstr.is_null() || exc {
+        None
+    } else {
+        Some(jstr as u64)
+    }
+}
+
+pub(crate) unsafe fn try_new_local_ref(env_ptr: u64, obj_ptr: u64) -> Option<u64> {
+    let env = env_ptr as JniEnv;
+    let obj = obj_ptr as *mut std::ffi::c_void;
+    if env.is_null() || obj.is_null() {
+        return None;
+    }
+    let new_local_ref: NewLocalRefFn = jni_fn!(env, NewLocalRefFn, JNI_NEW_LOCAL_REF);
+    let local = new_local_ref(env, obj);
+    let exc = jni_check_exc(env);
+    if local.is_null() || exc {
+        None
+    } else {
+        Some(local as u64)
+    }
+}
+
+pub(crate) unsafe fn try_delete_local_ref(env_ptr: u64, obj_ptr: u64) {
+    let env = env_ptr as JniEnv;
+    let obj = obj_ptr as *mut std::ffi::c_void;
+    if env.is_null() || obj.is_null() {
+        return;
+    }
+    let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
+    delete_local_ref(env, obj);
+}
+
+pub(crate) unsafe fn try_find_class(env_ptr: u64, name: &str) -> Option<u64> {
+    let env = env_ptr as JniEnv;
+    if env.is_null() {
+        return None;
+    }
+    let cstr = match std::ffi::CString::new(name) {
+        Ok(c) => c,
+        Err(_) => return None,
+    };
+    let find_class: FindClassFn = jni_fn!(env, FindClassFn, JNI_FIND_CLASS);
+    let cls = find_class(env, cstr.as_ptr());
+    let exc = jni_check_exc(env);
+    if cls.is_null() || exc {
+        None
+    } else {
+        Some(cls as u64)
     }
 }
 

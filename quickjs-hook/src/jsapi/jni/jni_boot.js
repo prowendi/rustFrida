@@ -445,6 +445,34 @@
                 _api._exceptionClear(e);
                 return true;
             },
+            findClass: function(envOrName, maybeName) {
+                // (name) 或 (env, name)
+                var resolved = _resolveEnvAndName.apply(null, arguments);
+                var raw = _api._findClass(resolved.env, resolved.name);
+                return raw === null || raw === undefined ? null : _toPtr(raw);
+            },
+            newStringUtf: function(envOrStr, maybeStr) {
+                var env, s;
+                if (arguments.length >= 2) {
+                    env = _getEnvPtr(envOrStr);
+                    s = String(maybeStr);
+                } else {
+                    env = _getCurrentThreadEnv();
+                    s = String(envOrStr);
+                }
+                var raw = _api._newStringUtf(env, s);
+                return raw === null || raw === undefined ? null : _toPtr(raw);
+            },
+            newLocalRef: function(envOrObj, maybeObj) {
+                var resolved = _resolveEnvAndRef.apply(null, arguments);
+                var raw = _api._newLocalRef(resolved.env, resolved.ref);
+                return raw === null || raw === undefined ? null : _toPtr(raw);
+            },
+            deleteLocalRef: function(envOrObj, maybeObj) {
+                var resolved = _resolveEnvAndRef.apply(null, arguments);
+                _api._deleteLocalRef(resolved.env, resolved.ref);
+                return true;
+            },
             readJString: function(envOrJstr, maybeJstr) {
                 var resolved = _resolveEnvAndRef.apply(null, arguments);
                 var env = resolved.env;

@@ -1,6 +1,6 @@
 use crate::context::JSContext;
 use crate::ffi;
-use crate::jsapi::callback_util::extract_pointer_address;
+use crate::jsapi::callback_util::{extract_pointer_address, extract_string_arg};
 use crate::jsapi::java::ensure_jni_initialized;
 use crate::jsapi::ptr::create_native_pointer;
 use crate::jsapi::util::add_cfunction_to_object;
@@ -286,6 +286,141 @@ unsafe extern "C" fn js_jni_exception_occurred(
     }
 }
 
+unsafe extern "C" fn js_jni_find_class(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    if argc < 1 {
+        return ffi::JS_ThrowTypeError(
+            ctx,
+            b"Jni._findClass() requires at least 1 argument: name\0".as_ptr() as *const _,
+        );
+    }
+
+    // 第一个参数要么是 env（显式）后跟 name，要么直接就是 name
+    let (env_ptr, name_idx) = if argc >= 2 {
+        let env = match extract_pointer_address(ctx, JSValue(*argv), "Jni._findClass") {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        (env, 1usize)
+    } else {
+        let env = match ensure_jni_initialized() {
+            Ok(e) => e as usize as u64,
+            Err(err) => {
+                let msg = CString::new(format!("Jni._findClass env init failed: {}", err)).unwrap_or_default();
+                return ffi::JS_ThrowInternalError(ctx, msg.as_ptr());
+            }
+        };
+        (env, 0usize)
+    };
+
+    let name = match extract_string_arg(
+        ctx, JSValue(*argv.add(name_idx)),
+        b"Jni._findClass: name must be a string\0",
+    ) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    match crate::jsapi::java::try_find_class(env_ptr, &name) {
+        Some(cls) => create_native_pointer(ctx, cls).raw(),
+        None => JSValue::null().raw(),
+    }
+}
+
+unsafe extern "C" fn js_jni_new_string_utf(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    if argc < 1 {
+        return ffi::JS_ThrowTypeError(
+            ctx,
+            b"Jni._newStringUtf() requires at least 1 argument: str\0".as_ptr() as *const _,
+        );
+    }
+
+    let (env_ptr, str_idx) = if argc >= 2 {
+        let env = match extract_pointer_address(ctx, JSValue(*argv), "Jni._newStringUtf") {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        (env, 1usize)
+    } else {
+        let env = match ensure_jni_initialized() {
+            Ok(e) => e as usize as u64,
+            Err(err) => {
+                let msg = CString::new(format!("Jni._newStringUtf env init failed: {}", err)).unwrap_or_default();
+                return ffi::JS_ThrowInternalError(ctx, msg.as_ptr());
+            }
+        };
+        (env, 0usize)
+    };
+
+    let s = match extract_string_arg(
+        ctx, JSValue(*argv.add(str_idx)),
+        b"Jni._newStringUtf: str must be a string\0",
+    ) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    match crate::jsapi::java::try_new_string_utf(env_ptr, &s) {
+        Some(jstr) => create_native_pointer(ctx, jstr).raw(),
+        None => JSValue::null().raw(),
+    }
+}
+
+unsafe extern "C" fn js_jni_new_local_ref(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    if argc < 1 {
+        return ffi::JS_ThrowTypeError(
+            ctx,
+            b"Jni._newLocalRef() requires at least 1 argument: obj\0".as_ptr() as *const _,
+        );
+    }
+
+    let (env_ptr, obj_ptr) = match resolve_env_and_ref(ctx, argc, argv, "Jni._newLocalRef", 2) {
+        Ok(v) => v,
+        Err(err) => return err,
+    };
+
+    match crate::jsapi::java::try_new_local_ref(env_ptr, obj_ptr) {
+        Some(local) => create_native_pointer(ctx, local).raw(),
+        None => JSValue::null().raw(),
+    }
+}
+
+unsafe extern "C" fn js_jni_delete_local_ref(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    if argc < 1 {
+        return ffi::JS_ThrowTypeError(
+            ctx,
+            b"Jni._deleteLocalRef() requires at least 1 argument: obj\0".as_ptr() as *const _,
+        );
+    }
+
+    let (env_ptr, obj_ptr) = match resolve_env_and_ref(ctx, argc, argv, "Jni._deleteLocalRef", 2) {
+        Ok(v) => v,
+        Err(err) => return err,
+    };
+
+    crate::jsapi::java::try_delete_local_ref(env_ptr, obj_ptr);
+    JSValue::bool(true).raw()
+}
+
 pub fn register_jni_api(ctx: &JSContext) {
     let global = ctx.global_object();
 
@@ -302,6 +437,10 @@ pub fn register_jni_api(ctx: &JSContext) {
         add_cfunction_to_object(ctx_ptr, jni_obj, "_exceptionCheck", js_jni_exception_check, 1);
         add_cfunction_to_object(ctx_ptr, jni_obj, "_exceptionClear", js_jni_exception_clear, 1);
         add_cfunction_to_object(ctx_ptr, jni_obj, "_exceptionOccurred", js_jni_exception_occurred, 1);
+        add_cfunction_to_object(ctx_ptr, jni_obj, "_findClass", js_jni_find_class, 2);
+        add_cfunction_to_object(ctx_ptr, jni_obj, "_newStringUtf", js_jni_new_string_utf, 2);
+        add_cfunction_to_object(ctx_ptr, jni_obj, "_newLocalRef", js_jni_new_local_ref, 2);
+        add_cfunction_to_object(ctx_ptr, jni_obj, "_deleteLocalRef", js_jni_delete_local_ref, 2);
         add_cfunction_to_object(ctx_ptr, jni_obj, "_threadEnv", js_jni_thread_env, 0);
         global.set_property(ctx_ptr, "Jni", JSValue(jni_obj));
     }

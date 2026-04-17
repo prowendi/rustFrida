@@ -605,15 +605,24 @@ Jni.env.getClassName(jclass)        // → "android.app.Activity"
 Jni.env.getObjectClassName(jobject) // → 对象的类名
 Jni.env.readJString(jstring)        // → JS string
 Jni.env.getObjectClass(obj)         // → jclass
-Jni.env.getSuperclass(clazz)        // → jclass
+Jni.env.getSuperclass(clazz)        // → jclass (Object 返 null)
 Jni.env.isSameObject(a, b)          // → boolean
 Jni.env.isInstanceOf(obj, clazz)    // → boolean
 Jni.env.exceptionCheck()            // → boolean
 Jni.env.exceptionClear()
+Jni.env.exceptionOccurred()         // → jthrowable | null
+
+// 构造/引用 (Rust 直路, 不走 callNative → dladdr, hook context 内安全)
+Jni.env.findClass("java/lang/String") // → jclass | null
+Jni.env.newStringUtf("hello")         // → jstring | null
+Jni.env.newLocalRef(obj)              // → jobject | null
+Jni.env.deleteLocalRef(obj)           // → undefined
 
 Jni.structs.JNINativeMethod.readArray(addr, count)  // → JNINativeMethodInfo[]
 Jni.structs.jvalue.readArray(addr, typesOrSig)      // → any[]
 ```
+
+**ref API 都接受**：`NativePointer` / BigInt / 十六进制字符串 / `{__jptr: ...}` wrapper。**所有方法都接受可选 env 首参**：`Jni.env.findClass(envPtr, "java/lang/String")`，省略则走 `ensure_jni_initialized` 自动 attach 当前线程。所有 JNI 调用失败后异常被兜底 clear，不会串到下一次调用。
 
 ### API 速查
 
@@ -626,6 +635,10 @@ Jni.structs.jvalue.readArray(addr, typesOrSig)      // → any[]
 | `Jni.table` | — | `Record<string, JniEntry>` |
 | `Jni.env.getClassName(clazz)` | `AddressLike` | `string \| null` |
 | `Jni.env.readJString(jstr)` | `AddressLike` | `string \| null` |
+| `Jni.env.findClass(name)` | `string` | `NativePointer \| null` |
+| `Jni.env.newStringUtf(str)` | `string` | `NativePointer \| null` |
+| `Jni.env.newLocalRef(obj)` | `AddressLike` | `NativePointer \| null` |
+| `Jni.env.deleteLocalRef(obj)` | `AddressLike` | `true` |
 | `Jni.structs.JNINativeMethod.readArray(addr, count)` | `AddressLike, number` | `JNINativeMethodInfo[]` |
 
 ### 实战：监控 RegisterNatives
