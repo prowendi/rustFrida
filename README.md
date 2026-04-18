@@ -194,7 +194,7 @@ curl http://127.0.0.1:9191/sessions
 
 ### 全局对象一览
 
-`console`, `ptr()`, `Memory`, `Module`, `hook()`, `unhook()`, `callNative()`, `qbdi`, `Java`, `Jni`
+`console`, `ptr()`, `Memory`, `Module`, `Interceptor`, `hook()`, `unhook()`, `callNative()`, `qbdi`, `Java`, `Jni`
 
 ### 常用类型别名
 
@@ -244,6 +244,23 @@ type JavaStaticThis = {
 //   this.field.value          // 实例方法: 直接读字段
 //   return this.$orig(a, b, c) // 调原方法
 // }
+
+// Interceptor.attach 双阶段：args 是 NativePointer 代理（args[0] = x0），
+// retval 支持 .replace() / .toInt32()；this 在 onEnter/onLeave 之间共享
+type InterceptorArgs = {
+  [i: number]: NativePointer    // args[0..30] ⇄ ctx.x0..x30（读/写）
+}
+type InterceptorRetval = NativePointer & {
+  replace(v: AddressLike): void // 改返回值
+  toInt32(): number
+  toUInt32(): number
+}
+type InterceptorThis = {
+  x0 ~ x30: bigint; sp: bigint; pc: bigint
+  lr: bigint; returnAddress: bigint
+  // + 用户自定义字段，onEnter/onLeave 跨阶段共享（Frida 兼容）
+}
+type InvocationListener = { detach(): boolean }
 
 type JniEntry = { name: string; index: number; address: NativePointer }
 
@@ -322,6 +339,45 @@ atan2(1.0, 2.0);
 AAPCS64 调用约定：整数/指针先填 x0-x7，浮点先填 d0-d7（两队列独立），超出部分自动压栈。不支持 struct-by-value。
 
 
+### Interceptor（Frida 兼容双阶段）
+
+Frida 原生语法。`hook()` 是 replace 单阶段；`Interceptor.attach` 自动执行原函数并提供 `onEnter` / `onLeave` 双阶段拦截，`this` 在两阶段之间共享。
+
+```js
+// 双阶段 attach: onEnter 前置 + 自动调原函数 + onLeave 后置
+var listener = Interceptor.attach(Module.findExportByName("libc.so", "open"), {
+    onEnter(args) {
+        // args[0..30] 是 NativePointer 代理，args[N] = value 会写回 xN
+        this.path = args[0].readCString();
+        this.t0 = Date.now();
+    },
+    onLeave(retval) {
+        // retval 是 NativePointer，.replace(v) 改返回值
+        console.log("open(" + this.path + ") = " + retval.toInt32()
+                  + " took " + (Date.now() - this.t0) + "ms");
+        if (retval.toInt32() < 0) retval.replace(0);
+    }
+});
+listener.detach();
+
+// 仅 onEnter — 改参数后让原函数自己跑（C 侧走 tail-jump 快路径，无栈帧残留）
+Interceptor.attach(target, {
+    onEnter(args) { args[1] = ptr(100); }
+});
+
+// Interceptor.replace — 完全替换（等价于 hook()，不跑原函数）
+Interceptor.replace(Module.findExportByName("libc.so", "getpid"), function() {
+    return 1234;
+});
+
+// 清理：单个 / 全部
+listener.detach();
+Interceptor.detachAll();
+Interceptor.flush();           // no-op，兼容脚本
+```
+
+第三参数可选 stealth 模式（同 `hook()`）：`Interceptor.attach(target, cbs, Hook.WXSHADOW)`。
+
 ### Stealth 模式
 
 ```js
@@ -338,6 +394,10 @@ hook(target, callback, true)            // true = WXSHADOW
 | --- | --- | --- |
 | `hook(target, callback, stealth?)` | `AddressLike, Function, number?` | `boolean` |
 | `unhook(target)` | `AddressLike` | `boolean` |
+| `Interceptor.attach(target, {onEnter?, onLeave?}, stealth?)` | `AddressLike, Object, number?` | `InvocationListener` |
+| `Interceptor.replace(target, replacement, stealth?)` | `AddressLike, Function, number?` | `boolean` |
+| `Interceptor.detachAll()` | — | `undefined` |
+| `listener.detach()` | — | `boolean` |
 | `callNative(func, ...args)` | `AddressLike, ...AddressLike` (最多6个) | `number \| bigint` |
 | `new NativeFunction(addr, retType, argTypes)` | `AddressLike, string, string[]` | `Function` (可调用，任意签名) |
 | `diagAllocNear(addr)` | `AddressLike` | `undefined` |
