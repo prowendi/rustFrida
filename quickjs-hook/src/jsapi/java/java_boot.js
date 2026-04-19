@@ -168,7 +168,30 @@
 
         // --- 数组类型 ---
         if (t0 === '[') {
-            if (Array.isArray(jsVal)) return 8;
+            if (Array.isArray(jsVal)) {
+                var elem = jniType.charAt(1);
+                // String[] / Object[] — JS array of strings 优先匹配
+                if (elem === 'L') {
+                    if (jniType === "[Ljava/lang/String;") {
+                        if (jsVal.length === 0) return 8;
+                        for (var k = 0; k < jsVal.length; k++) {
+                            if (typeof jsVal[k] !== "string") return -1;
+                        }
+                        return 10;
+                    }
+                    if (jniType === "[Ljava/lang/Object;") return 5;
+                    return -1;
+                }
+                // 嵌套数组 [[X 暂不支持, 让出
+                if (elem === '[') return -1;
+                // 原始类型数组: 按元素实际范围选最精确的类型
+                return _scoreArrayElements(jsVal, elem);
+            }
+            if (jsType === "object" && jsVal.__jptr !== undefined) {
+                // Java 数组对象 {__jptr, __jclass="[B"/...} 透传
+                if (typeof jsVal.__jclass === "string" && jsVal.__jclass === jniType) return 10;
+                return 5;
+            }
             if (jsType === "object") return 4;
             return -1;
         }
@@ -242,6 +265,88 @@
     // 兼容性检查（保留旧名字供其它地方调用；内部走评分函数）
     function _isJsValueCompatible(jsVal, jniType) {
         return _scoreJsParam(jsVal, jniType) >= 0;
+    }
+
+    // 按数组元素实际范围给 JS array vs Java 原始数组打分。
+    // 分数高低指示该 overload 对给定 JS 数据的精确度:
+    //   [1,2,3] 完美装 byte[] (10) 也能装 int[] (8), 选 byte[];
+    //   [1,200,3] 只能装 int[] (8), 选 int[];
+    //   [1n,2n] 装 long[] (10);
+    //   [true,false] 装 boolean[] (10).
+    // 返回 -1 表示该数组元素与目标类型不兼容 (例: bigint 不能进 int[])。
+    function _scoreArrayElements(arr, elem) {
+        if (arr.length === 0) {
+            // 空数组: 无法区分元素类型, 按 Java 类型常用度优先
+            return elem === 'I' ? 10 : elem === 'J' ? 9
+                 : elem === 'S' ? 8 : elem === 'B' ? 7
+                 : elem === 'D' ? 7 : elem === 'F' ? 6
+                 : elem === 'Z' ? 8 : elem === 'C' ? 8 : 4;
+        }
+        // 逐元素分类:
+        //   allIntNumber: 全是 JS number 且都是整数
+        //   allBigInt:    全是 bigint
+        //   allLongLike:  允许 JS int + bigint 混合 (都能进 long)
+        //   allBool:      全是 boolean
+        //   allChar1:     全是单字符 string
+        //   allFloatLike: 全是 JS number 且含非整数
+        // 以及整数值的范围 byte/short/int (只在 allIntNumber 时有意义)
+        var allIntNumber = true, allBigInt = true, allLongLike = true;
+        var allBool = true, allChar1 = true, allFloatLike = true;
+        var hasFloat = false, hasInt = false, hasBigInt = false;
+        var allInByte = true, allInShort = true, allInInt = true;
+        for (var i = 0; i < arr.length; i++) {
+            var v = arr[i];
+            var t = typeof v;
+            if (t === "boolean") {
+                allIntNumber = allBigInt = allLongLike = allChar1 = allFloatLike = false;
+                continue;
+            }
+            if (t === "bigint") {
+                allIntNumber = allBool = allChar1 = allFloatLike = false;
+                hasBigInt = true;
+                continue;
+            }
+            if (t === "string") {
+                allIntNumber = allBigInt = allLongLike = allBool = allFloatLike = false;
+                if (v.length !== 1) allChar1 = false;
+                continue;
+            }
+            if (t !== "number") return -1;
+            allBool = allBigInt = allChar1 = false;
+            if (!Number.isInteger(v)) {
+                allIntNumber = allLongLike = false;
+                hasFloat = true;
+                continue;
+            }
+            hasInt = true;
+            allFloatLike = false;
+            if (v < -128 || v > 127) allInByte = false;
+            if (v < -32768 || v > 32767) allInShort = false;
+            if (v < -2147483648 || v > 2147483647) allInInt = false;
+        }
+        if (elem === 'Z') return allBool ? 10 : -1;
+        if (elem === 'C') return allChar1 ? 10 : (allIntNumber && allInShort ? 7 : -1);
+        if (elem === 'B') return allIntNumber && allInByte ? 10 : -1;
+        if (elem === 'S') return allIntNumber && allInShort ? 9 : -1;
+        if (elem === 'I') return allIntNumber && allInInt ? 8 : -1;
+        if (elem === 'J') {
+            // long[]: 纯 bigint 最佳 10; bigint+int 混合 9; 纯 int 降级 7
+            if (allBigInt) return 10;
+            if (allLongLike && hasBigInt) return 9;
+            if (allIntNumber) return 7;
+            return -1;
+        }
+        if (elem === 'F') {
+            if (hasFloat && !hasBigInt) return 6;
+            if (allIntNumber) return 4;
+            return -1;
+        }
+        if (elem === 'D') {
+            if (hasFloat && !hasBigInt) return 7;
+            if (allIntNumber) return 5;
+            return -1;
+        }
+        return 4;
     }
 
     function _scoreOverload(methodInfo, jsArgs) {

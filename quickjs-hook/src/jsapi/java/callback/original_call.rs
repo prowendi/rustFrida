@@ -239,7 +239,40 @@ unsafe fn js_array_to_java_primitive_array(
             JNI_NEW_DOUBLE_ARRAY, JNI_SET_DOUBLE_ARRAY_REGION, SetDoubleArrayRegionFn, f64,
             |_ctx: *mut ffi::JSContext, v: JSValue| v.to_float().unwrap_or(0.0)
         ),
-        _ => None,  // `[Ljava/...;` 或 `[[...` 嵌套数组 — 不处理
+        b'L' => {
+            // 对象数组: 目前支持 [Ljava/lang/String; — 其它走 [Object 通用路径。
+            // 取 sig 的内层 Class (去掉前导 '[', 末尾 ';') 作为 NewObjectArray 的元素 class。
+            let inner_sig = &sig[1..]; // e.g. "Ljava/lang/String;"
+            if !inner_sig.starts_with('L') || !inner_sig.ends_with(';') {
+                return None;
+            }
+            let inner_class_name = &inner_sig[1..inner_sig.len() - 1]; // "java/lang/String"
+            let cls = super::reflect::find_class_safe(env, inner_class_name);
+            if cls.is_null() {
+                return None;
+            }
+            let new_obj_arr: NewObjectArrayFn = jni_fn!(env, NewObjectArrayFn, JNI_NEW_OBJECT_ARRAY);
+            let jarr = new_obj_arr(env, len, cls, std::ptr::null_mut());
+            if jarr.is_null() {
+                let delete: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
+                delete(env, cls);
+                return None;
+            }
+            let set_elem: SetObjectArrayElementFn =
+                jni_fn!(env, SetObjectArrayElementFn, JNI_SET_OBJECT_ARRAY_ELEMENT);
+            for i in 0..len {
+                let elem_raw = ffi::JS_GetPropertyUint32(ctx, arr.raw(), i as u32);
+                let elem = JSValue(elem_raw);
+                // 逐个 marshal, 复用 marshal_js_to_jvalue L 分支支持 string/__jptr 透传
+                let elem_jval = marshal_js_to_jvalue(ctx, env, elem, Some(inner_sig));
+                elem.free(ctx);
+                set_elem(env, jarr, i, elem_jval as *mut std::ffi::c_void);
+            }
+            let delete: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
+            delete(env, cls);
+            Some(jarr as u64)
+        }
+        _ => None,  // `[[...` 嵌套数组 — 不处理
     }
 }
 
