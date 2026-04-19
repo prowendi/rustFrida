@@ -814,6 +814,7 @@ Memory.protect(dataAddr, 8, "r--");
 | `Module.enumerateImports(name)` | `string` | `{type, name, slot, address}[]` |
 | `Module.enumerateSymbols(name)` | `string` | `{type, name, address, isGlobal, isDefined}[]` |
 | `Module.enumerateRanges(name, prot?)` | `string, "rwx" 风格` | `{base, size, protection, file:{path}}[]` |
+| `Module.load(path, flags?)` | `string, int?` | `ModuleInfo` / 抛异常 |
 
 ```js
 // 导出：defined + global/weak 符号
@@ -828,6 +829,38 @@ Module.enumerateImports("libart.so").filter(i => i.type === "function");
 ```
 
 枚举的来源是模块的磁盘 ELF；memfd 或无文件支撑的合成模块返回空数组。
+
+### Module.load — 运行时加载 SO
+
+走 unrestricted linker (`__loader_dlopen`)，绕开 namespace 限制 + `hide_soinfo` 的 caller 解析问题。加载成功后从 `/proc/self/maps` 解析 `{name, base, size, path}` 返回；失败抛带 `dlerror` 原始消息的 `InternalError`。
+
+```js
+// 短名：走 linker 搜索路径
+var m = Module.load("libz.so");
+// { name: "libz.so", base: 0x7062dec000, size: 110592, path: "/vendor/lib64/libz.so" }
+
+// 绝对路径
+Module.load("/system/lib64/libsqlite.so");
+
+// 自定义 flags（默认 RTLD_NOW = 2；RTLD_LAZY = 1）
+Module.load("/data/local/tmp/mylib.so", 1);
+
+// 错误处理
+try {
+    Module.load("/does/not/exist.so");
+} catch (e) {
+    console.log(e.message);
+    // → "Module.load: dlopen('/does/not/exist.so') failed: library \"...\" not found"
+}
+
+// 加载后立刻查符号
+var m = Module.load("libcustom.so");
+var addr = Module.findExportByName(m.name, "my_func");
+```
+
+**注意**：
+- 若模块被 `hide_soinfo` 隐藏或通过 memfd 加载，`/proc/self/maps` 可能查不到，此时返回 `{name, path, base: <dlopen handle>, size: 0}` 作 fallback。
+- `Module.load` 不会重复加载同一个 SO — linker 对已加载模块返回现有 handle。
 
 ## ptr / NativePointer
 
