@@ -389,12 +389,13 @@
 
     // 每个类的字段元数据缓存: cls → { prop → meta{id,sig,st,cls} | null }
     // null 表示已探测过但不是字段（即方法），避免重复 C 调用
-    var _classFieldMeta = {};
+    // 用 Object.create(null) 避免 "toString"/"valueOf" 等名字命中 Object.prototype
+    var _classFieldMeta = Object.create(null);
 
     function _resolveFieldMeta(cls, prop, objPtr) {
         var cache = _classFieldMeta[cls];
         if (!cache) {
-            cache = {};
+            cache = Object.create(null);
             _classFieldMeta[cls] = cache;
         }
         if (prop in cache) return cache[prop];
@@ -439,11 +440,11 @@
     // 同名时返回 hybrid：可调用（方法） + .value（字段）
     // ========================================================================
 
-    var _classMethodNames = {};
+    var _classMethodNames = Object.create(null);
     function _hasMethod(cls, name) {
         var set = _classMethodNames[cls];
         if (!set) {
-            set = {};
+            set = Object.create(null);
             var ms = _methods(cls);
             for (var i = 0; i < ms.length; i++) set[ms[i].name] = true;
             _classMethodNames[cls] = set;
@@ -480,7 +481,7 @@
     // - 快捷调用:   obj.$call("methodName", "(sig)", ...args)
     // 内部：用已存在的 target 创建 Proxy（共享 mutable target 用于"释放"语义）
     function _wrapJavaObjOnTarget(target) {
-        var fieldWrappers = {};  // per-instance FieldWrapper 缓存
+        var fieldWrappers = Object.create(null);  // per-instance FieldWrapper 缓存 (无原型, 避 toString 等名冲突)
         var isArray = typeof target.__jclass === "string" && target.__jclass[0] === "[";
 
         var handler = {
@@ -846,9 +847,11 @@
     }
 
     Java.use = function(cls) {
-        var cache = {};
-        var wrappers = {};
-        var staticFieldWrappers = {};
+        // Object.create(null) 避免 "toString" / "valueOf" / "hasOwnProperty" 等
+        // Object.prototype 方法名被当作"已缓存"命中, 错返 Object.prototype.toString
+        var cache = Object.create(null);
+        var wrappers = Object.create(null);
+        var staticFieldWrappers = Object.create(null);
         // 静态字段用虚拟 target（_readField/isStatic=true 时 objPtr 被忽略）
         var staticTarget = {__jptr: 0, __jclass: cls};
         return new Proxy({}, {
@@ -917,7 +920,7 @@
             ownKeys: function(_) {
                 if (cache._ownKeys) return cache._ownKeys;
                 var ms = _methods(cls);
-                var seen = {};
+                var seen = Object.create(null);
                 var keys = [];
                 keys.push("$new");
                 for (var i = 0; i < ms.length; i++) {
