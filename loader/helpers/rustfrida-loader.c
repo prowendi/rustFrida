@@ -120,11 +120,12 @@ frida_main (void * user_data)
   int ctrlfd_for_peer, ctrlfd, agent_codefd, agent_ctrlfd;
 
   thread_id = frida_gettid ();
-  /* IMMEDIATE: agent 在 shutdown 时 drain thunk_in_flight=0 后才 munmap pool,
-   * 无限等待直到归零 (quickjs_loader::cleanup) — 保证 dlclose 时没有残留 thunk,
-   * exec pool 已 munmap, 不会有 use-after-unload。完整卸载 agent.so 释放 ~3MB,
-   * 同一进程可反复 inject。*/
-  unload_policy = FRIDA_UNLOAD_POLICY_IMMEDIATE;
+  /* RESIDENT: agent.so 常驻进程内。hide_soinfo 从 linker solist 摘了自己 —
+   * dlclose 会走 "soinfo 不在 list / double unload" 路径 abort, 需要额外
+   * unhide_from_solist + solist_add_soinfo. 实测 solist_add 对已 remove 的
+   * soinfo 直接 SEGV (sonext 语义差异), 暂不 dlclose。Agent 内存 ~3MB 常驻;
+   * 同进程 re-inject 依赖 memfd 新 inode 让 linker 创建第二实例. */
+  unload_policy = FRIDA_UNLOAD_POLICY_RESIDENT;
   ctrlfd = -1;
   agent_codefd = -1;
   agent_ctrlfd = -1;

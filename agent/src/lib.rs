@@ -179,6 +179,11 @@ pub extern "C" fn hello_entry(args_ptr: *mut c_void) -> *mut c_void {
     }
     // 关闭 socket，host 收到 EOF 自然退出
     shutdown_stream();
+
+    // 不调 unhide_from_solist: loader 走 RESIDENT 不 dlclose, 不需要恢复;
+    // 实测 solist_add_soinfo 对已 remove 的 soinfo SEGV (sonext 语义冲突)。
+    // 留着函数, 未来对接可 dlclose 的方案时再启用。
+
     null_mut()
 }
 

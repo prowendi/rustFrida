@@ -8,6 +8,7 @@ fn main() -> anyhow::Result<()> {
     // --export-dynamic-symbol 导出到动态符号表供 dlsym 查询
     cc::Build::new().file("src/hide_soinfo.c").compile("hide_soinfo");
     println!("cargo:rustc-cdylib-link-arg=-Wl,-u,get_hide_result,--export-dynamic-symbol=get_hide_result");
+    println!("cargo:rustc-cdylib-link-arg=-Wl,-u,unhide_from_solist,--export-dynamic-symbol=unhide_from_solist");
 
     Ok(())
 }

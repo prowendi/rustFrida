@@ -31,6 +31,13 @@ struct hide_result {
     char error[128];        /* offset 32: 错误描述 */
     char target_path[128];  /* offset 160: 被隐藏目标的路径 */
     char head_path[128];    /* offset 288: head 的路径 */
+    /* unhide 需要的 linker 符号 — 从 hide 时保存 */
+    uint64_t solist_add_soinfo;     /* 恢复到 soinfo list 用 */
+    uint64_t r_debug;               /* link_map 恢复用 */
+    uint64_t saved_link_map;        /* 隐藏前的 link_map 指针 */
+    uint64_t saved_lm_prev;         /* 隐藏前的 l_prev */
+    uint64_t saved_lm_next;         /* 隐藏前的 l_next */
+    uint64_t r_debug_tail;
 };
 
 static struct hide_result g_hide_result = {0};
@@ -298,6 +305,11 @@ static void hide_from_solist(void) {
             g_hide_result.target_ptr = (uint64_t)cur;
             strncpy(g_hide_result.target_path, path, sizeof(g_hide_result.target_path) - 1);
 
+            /* 保存 unhide 所需的 linker 符号 */
+            g_hide_result.solist_add_soinfo = syms.solist_add_soinfo;
+            g_hide_result.r_debug = syms.r_debug;
+            g_hide_result.r_debug_tail = syms.r_debug_tail;
+
             /* 1. 从 soinfo 链表摘除（dl_iterate_phdr 使用此链表） */
             do_remove(cur);
 
@@ -325,6 +337,11 @@ static void hide_from_solist(void) {
                 struct link_map_entry *lm = (struct link_map_entry *)(*r_map_ptr);
                 while (lm) {
                     if (lm->l_name && strstr(lm->l_name, "wwb_so")) {
+                        /* 保存原始邻居供 unhide 恢复 */
+                        g_hide_result.saved_link_map = (uint64_t)lm;
+                        g_hide_result.saved_lm_prev = (uint64_t)lm->l_prev;
+                        g_hide_result.saved_lm_next = (uint64_t)lm->l_next;
+
                         /* 从双向链表摘除 */
                         if (lm->l_prev)
                             lm->l_prev->l_next = lm->l_next;
@@ -354,4 +371,64 @@ static void hide_from_solist(void) {
 
     g_hide_result.entries_scanned = count;
     FAIL(-9, "target not found in solist");
+}
+
+/**
+ * 恢复 agent soinfo + link_map 到 linker 链表。
+ *
+ * 在 agent dlclose 之前调用：linker 的 soinfo_unload 会验证
+ * "soinfo 是否在 soinfo_list 中"，若不在则 abort "double unload?"。
+ * hide 时摘除了 soinfo，必须重新插入才能 dlclose。
+ *
+ * 返回 1 成功, 0 无需恢复/无效, 负数错误。
+ */
+typedef void (*add_soinfo_fn)(void *);
+
+__attribute__((visibility("default")))
+int unhide_from_solist(void) {
+    if (g_hide_result.status != 1) return 0;  /* 从未 hide 成功, 无需恢复 */
+    if (g_hide_result.target_ptr == 0) return 0;
+    if (g_hide_result.solist_add_soinfo == 0) return -1;
+
+    /* 1. 重新加入 soinfo list */
+    add_soinfo_fn do_add = (add_soinfo_fn)g_hide_result.solist_add_soinfo;
+    do_add((void *)g_hide_result.target_ptr);
+
+    /* 2. 恢复 link_map 到 _r_debug.r_map 双向链表 */
+    if (g_hide_result.r_debug && g_hide_result.saved_link_map) {
+        struct link_map_entry {
+            uint64_t l_addr;
+            char *l_name;
+            uint64_t l_ld;
+            struct link_map_entry *l_next;
+            struct link_map_entry *l_prev;
+        };
+        struct link_map_entry *lm = (struct link_map_entry *)g_hide_result.saved_link_map;
+        struct link_map_entry *prev = (struct link_map_entry *)g_hide_result.saved_lm_prev;
+        struct link_map_entry *next = (struct link_map_entry *)g_hide_result.saved_lm_next;
+        uint64_t *r_map_ptr = (uint64_t *)(g_hide_result.r_debug + 0x08);
+
+        /* 恢复自身的 prev/next */
+        lm->l_prev = prev;
+        lm->l_next = next;
+
+        /* 让 prev/next 指回自己 */
+        if (prev) {
+            prev->l_next = lm;
+        } else {
+            /* 曾经是 head, 把 r_map 指回去 */
+            *r_map_ptr = (uint64_t)lm;
+        }
+        if (next) {
+            next->l_prev = lm;
+        } else if (g_hide_result.r_debug_tail) {
+            /* 曾经是 tail, 更新 r_debug_tail */
+            uint64_t *tail_ptr = (uint64_t *)g_hide_result.r_debug_tail;
+            *tail_ptr = (uint64_t)lm;
+        }
+    }
+
+    /* 标记已恢复, 避免重复 unhide */
+    g_hide_result.status = 2;
+    return 1;
 }
