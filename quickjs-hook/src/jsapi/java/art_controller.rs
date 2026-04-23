@@ -913,16 +913,22 @@ pub(crate) fn get_interpreter_bridge() -> u64 {
 /// 返回 1 = 正常路由到 replacement，返回 0 = 跳过（callOriginal bypass 或 stack 递归 或 JS engine 繁忙）。
 #[no_mangle]
 pub unsafe extern "C" fn art_router_stack_check(replacement: u64) -> i32 {
-    // JS engine busy 检测: 如果 JS_ENGINE 被其他线程占用, 直接走 not_found 路径
-    // (trampoline 走原方法), 不进 replacement/callback.
-    // 避免后续 callback 在 acquire_js_engine_for_callback 等 20ms 超时 → fallback
-    // invoke_original_jni 并发调 JNI, 破坏 HashMap 之类非线程安全结构的状态.
-    //
-    // 用 JS_ENGINE_OWNER_THREAD atomic 检测 (callback 整个执行期间稳定):
-    //   owner == 0        → JS 空闲, 路由
-    //   owner == self     → reentrant (ctx.orig), 路由
-    //   owner == other    → 别的线程在跑 callback, 走原方法
-    // 比 try_lock + drop 更稳: 不需 acquire/release 锁, 无 race 窗口.
+    // Lua hook 快速路径: 无 JS engine 锁, 无 cooldown gate, 每次都执行
+    let original_for_lua = hook_ffi::hook_art_router_table_lookup_original(replacement);
+    if original_for_lua != 0 && crate::lua::is_lua_hook(original_for_lua) {
+        // Lua hook: 只检查 bypass 栈和 managed stack
+        let stack = get_bypass_stack();
+        if !stack.is_empty() {
+            for &bypassed in stack.iter() {
+                if bypassed == original_for_lua {
+                    return 0;
+                }
+            }
+        }
+        return if should_replace_for_stack(replacement) { 1 } else { 0 };
+    }
+
+    // JS hook: JS engine busy 检测 + cooldown gate
     let current_thread = crate::current_thread_id_u64();
     let owner = crate::JS_ENGINE_OWNER_THREAD.load(std::sync::atomic::Ordering::Acquire);
     if owner == current_thread {
@@ -948,7 +954,11 @@ pub unsafe extern "C" fn art_router_stack_check(replacement: u64) -> i32 {
     // TLS bypass 栈: 检查栈中是否有任何一个 entry 匹配当前 replacement 的 original
     let stack = get_bypass_stack();
     if !stack.is_empty() {
-        let original = hook_ffi::hook_art_router_table_lookup_original(replacement);
+        let original = if original_for_lua != 0 {
+            original_for_lua
+        } else {
+            hook_ffi::hook_art_router_table_lookup_original(replacement)
+        };
         if original != 0 {
             for &bypassed in stack.iter() {
                 if bypassed == original {
@@ -957,7 +967,6 @@ pub unsafe extern "C" fn art_router_stack_check(replacement: u64) -> i32 {
             }
         }
     }
-
 
     // Fallback: managed stack check (对标 Frida, 覆盖其他递归场景)
     if should_replace_for_stack(replacement) { 1 } else { 0 }

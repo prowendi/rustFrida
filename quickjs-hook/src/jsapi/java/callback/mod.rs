@@ -27,10 +27,10 @@ thread_local! {
     static IN_JAVA_HOOK_CALLBACK: Cell<bool> = const { Cell::new(false) };
 }
 
-pub(super) struct JavaHookCallbackScope;
+pub(crate) struct JavaHookCallbackScope;
 
 impl JavaHookCallbackScope {
-    pub(super) fn enter() -> Self {
+    pub(crate) fn enter() -> Self {
         IN_JAVA_HOOK_CALLBACK.with(|flag| flag.set(true));
         Self
     }

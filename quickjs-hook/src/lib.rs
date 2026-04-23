@@ -29,6 +29,7 @@ mod completion;
 pub mod context;
 pub mod ffi;
 pub mod jsapi;
+pub mod lua;
 pub mod recomp;
 pub mod runtime;
 pub mod value;
@@ -52,6 +53,8 @@ pub use jsapi::java::art_controller::{
 };
 pub use runtime::JSRuntime;
 pub use value::JSValue;
+
+pub use lua::compile_lua_callback;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};

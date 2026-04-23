@@ -108,6 +108,64 @@ fn main() {
         println!("cargo:warning=Or run: cd quickjs-hook && ./setup_quickjs.sh");
     }
 
+    // Compile Lua 5.4 sources (multi-threaded callback engine)
+    let lua_src = PathBuf::from(&manifest_dir).join("lua-src");
+    let lua_h = lua_src.join("lua.h");
+    if lua_h.exists() {
+        let mut lua_build = cc::Build::new();
+        lua_build
+            .include(&lua_src)
+            .opt_level(2)
+            .flag("-fPIC")
+            .flag("-fno-exceptions")
+            .flag("-DLUA_USE_POSIX")
+            .warnings(false);
+
+        if env::var("TARGET").unwrap_or_default().contains("android") {
+            lua_build.flag("-DANDROID");
+        }
+
+        for entry in std::fs::read_dir(&lua_src).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().map_or(false, |e| e == "c") {
+                lua_build.file(&path);
+            }
+        }
+        lua_build.compile("lua54");
+
+        let lua_bindings = bindgen::Builder::default()
+            .header(lua_src.join("lua.h").to_string_lossy().to_string())
+            .header(lua_src.join("lauxlib.h").to_string_lossy().to_string())
+            .header(lua_src.join("lualib.h").to_string_lossy().to_string())
+            .clang_arg(format!("-I{}", lua_src.display()))
+            .clang_arg("-xc")
+            .generate_comments(false)
+            .derive_debug(true)
+            .derive_default(true)
+            .layout_tests(false)
+            .allowlist_function("lua_.*")
+            .allowlist_function("luaL_.*")
+            .allowlist_function("luaopen_.*")
+            .allowlist_type("lua_.*")
+            .allowlist_var("LUA_.*")
+            .use_core()
+            .generate()
+            .expect("Unable to generate Lua bindings");
+
+        lua_bindings
+            .write_to_file(out_path.join("lua_bindings.rs"))
+            .expect("Couldn't write Lua bindings!");
+
+        println!("cargo:rustc-link-lib=static=lua54");
+    } else {
+        std::fs::write(
+            out_path.join("lua_bindings.rs"),
+            "// Lua source not found - run: cd quickjs-hook && ./setup_lua.sh\n",
+        )
+        .expect("Failed to write placeholder Lua bindings");
+        println!("cargo:warning=Lua source not found at {:?}", lua_src);
+    }
+
     // Generate bindings for hook_engine (includes arm64_writer and arm64_relocator)
     let hook_bindings = bindgen::Builder::default()
         .header(src_path.join("hook_engine.h").to_string_lossy().to_string())
@@ -175,4 +233,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/quickjs_wrapper.c");
     println!("cargo:rerun-if-changed=src/quickjs_wrapper.h");
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=lua-src/lua.h");
+    println!("cargo:rerun-if-changed=lua-src/lauxlib.h");
+    println!("cargo:rerun-if-changed=lua-src/lualib.h");
 }

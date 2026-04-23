@@ -93,6 +93,13 @@ pub(super) unsafe extern "C" fn java_hook_callback(
         return;
     }
 
+    // Lua hook 直接走独立路径 (无 JS gate, per-thread state)
+    let art_method_addr_check = user_data as u64;
+    if crate::lua::is_lua_hook(art_method_addr_check) {
+        crate::lua::callback::lua_hook_callback(ctx_ptr, user_data);
+        return;
+    }
+
     let _in_flight_guard = InFlightJavaHookGuard::enter();
     let _callback_scope = JavaHookCallbackScope::enter();
     let _gate_guard = crate::jsapi::java::art_controller::CallbackGateGuard;

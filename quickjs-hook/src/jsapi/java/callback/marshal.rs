@@ -16,7 +16,7 @@ pub(super) fn set_return_raw_wrapper(skip: bool) {
 
 /// 判断 JNI 类型签名是否表示浮点类型 (float/double)
 #[inline]
-fn is_floating_point_type(sig: Option<&str>) -> bool {
+pub(crate) fn is_floating_point_type(sig: Option<&str>) -> bool {
     matches!(sig, Some(s) if s.starts_with('F') || s.starts_with('D'))
 }
 
@@ -25,7 +25,7 @@ fn is_floating_point_type(sig: Option<&str>) -> bool {
 /// ARM64 JNI: GP 寄存器 (x2-x7) 和 FP 寄存器 (d0-d7) 有独立计数器。
 /// 返回 (gp_value, fp_value) — 只有一个有意义。
 #[inline]
-unsafe fn extract_jni_arg(
+pub(crate) unsafe fn extract_jni_arg(
     hook_ctx: &hook_ffi::HookContext,
     is_fp: bool,
     gp_index: &mut usize,

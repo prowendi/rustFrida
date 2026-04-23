@@ -76,10 +76,10 @@ pub(super) static JAVA_HOOK_REGISTRY: Mutex<Option<HashMap<u64, JavaHookData>>> 
 static IN_FLIGHT_JAVA_HOOK_CALLBACKS: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
 static IN_FLIGHT_JAVA_HOOK_CALLBACKS_CV: std::sync::Condvar = std::sync::Condvar::new();
 
-pub(super) struct InFlightJavaHookGuard;
+pub(crate) struct InFlightJavaHookGuard;
 
 impl InFlightJavaHookGuard {
-    pub(super) fn enter() -> Self {
+    pub(crate) fn enter() -> Self {
         let mut c = IN_FLIGHT_JAVA_HOOK_CALLBACKS.lock().unwrap_or_else(|e| e.into_inner());
         *c += 1;
         Self

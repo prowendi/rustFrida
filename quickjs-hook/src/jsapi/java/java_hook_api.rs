@@ -4,7 +4,9 @@
 
 mod install;
 mod install_support;
+mod lua_install;
 mod uninstall;
 
 pub(super) use install::js_java_hook;
+pub(super) use lua_install::js_lua_hook;
 pub(super) use uninstall::js_java_unhook;

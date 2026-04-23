@@ -33,7 +33,7 @@ mod art_class;
 pub mod art_controller;
 mod art_method;
 mod art_thread;
-mod callback;
+pub(crate) mod callback;
 mod heap_scan;
 mod java_array_api;
 mod java_choose_api;
@@ -41,8 +41,9 @@ mod java_field_api;
 mod java_hook_api;
 mod java_inspect_api;
 mod java_method_list_api;
-mod jni_core;
-mod reflect;
+pub(crate) mod jni_core;
+pub(crate) mod reflect;
+
 mod safe_mem;
 
 pub(crate) use jni_core::ensure_jni_initialized;
@@ -761,6 +762,7 @@ pub fn register_java_api(ctx: &JSContext) {
 
         let ctx_ptr = ctx.as_ptr();
         add_cfunction_to_object(ctx_ptr, java_obj, "hook", js_java_hook, 4);
+        add_cfunction_to_object(ctx_ptr, java_obj, "luaHook", js_lua_hook, 4);
         add_cfunction_to_object(ctx_ptr, java_obj, "unhook", js_java_unhook, 3);
         add_cfunction_to_object(ctx_ptr, java_obj, "deopt", js_java_deopt, 0);
         add_cfunction_to_object(ctx_ptr, java_obj, "deoptimizeBootImage", js_java_deoptimize_boot_image, 0);

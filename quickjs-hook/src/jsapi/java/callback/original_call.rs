@@ -379,7 +379,7 @@ unsafe fn autobox_primitive_to_jobject(
 ///
 /// 约束: JS 回调里如果 orig() 后再做 JNI 调用, CheckJNI 见 pending 会 abort;
 /// 用户需自己处理 (try/catch 或避免后续 JNI)。
-pub(super) unsafe fn invoke_original_jni(
+pub(crate) unsafe fn invoke_original_jni(
     env: JniEnv,
     art_method_addr: u64,
     class_global_ref: usize,
@@ -538,7 +538,7 @@ unsafe fn invoke_original_jni_inner(
 }
 
 /// Build jvalue args from HookContext registers (ARM64 JNI calling convention).
-pub(super) unsafe fn build_jargs_from_registers(
+pub(crate) unsafe fn build_jargs_from_registers(
     hook_ctx: &hook_ffi::HookContext,
     param_count: usize,
     param_types: &[String],
