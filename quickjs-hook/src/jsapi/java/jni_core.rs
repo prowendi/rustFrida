@@ -931,7 +931,7 @@ unsafe fn attach_current_thread(vm_ptr: *mut std::ffi::c_void) -> Result<JniEnv,
 /// Get a valid JNIEnv* for the current thread via AttachCurrentThread.
 /// Safe to call from any thread (hook callbacks run on the hooked thread).
 /// AttachCurrentThread is idempotent — returns existing env if already attached.
-pub(super) unsafe fn get_thread_env() -> Result<JniEnv, String> {
+pub(crate) unsafe fn get_thread_env() -> Result<JniEnv, String> {
     // ensure_jni_initialized now always returns current thread's env
     ensure_jni_initialized()
 }

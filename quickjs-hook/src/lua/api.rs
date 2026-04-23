@@ -15,7 +15,7 @@ pub(crate) fn clear_current_env() {
     CURRENT_ENV.with(|c| c.set(0));
 }
 
-fn get_current_env() -> *const std::ffi::c_void {
+pub(crate) fn get_current_env() -> *const std::ffi::c_void {
     CURRENT_ENV.with(|c| c.get() as *const std::ffi::c_void)
 }
 
@@ -235,7 +235,9 @@ unsafe fn try_tostring_via_method(
     Some(s)
 }
 
-/// ctx:orig() — 通过 JNI 调用原始方法
+/// self:orig() — 原始参数调用原始方法
+/// self:orig(a1, a2, ...) — 自定义参数调用原始方法
+/// 注意: `:` 语法会把 self 作为第一个参数传入 (Lua stack index 1)
 /// upvalue 1 = lightuserdata (CallbackContext*)
 pub(crate) unsafe extern "C" fn lua_call_original(
     L: *mut ffi::lua_State,
@@ -247,6 +249,26 @@ pub(crate) unsafe extern "C" fn lua_call_original(
     }
     let cb_ctx = &*(ctx_ptr as *const super::callback::CallbackContext);
 
+    // stack: [self, arg1, arg2, ...]
+    // self:orig() → nargs=1 (只有 self), 用原始参数
+    // self:orig(a,b) → nargs=3 (self + 2 args), 用自定义参数
+    let nargs = ffi::lua_gettop(L);
+    let user_arg_count = nargs - 1; // 减去 self
+
+    let (jargs_ptr, jargs_buf) = if user_arg_count > 0 && user_arg_count as usize == cb_ctx.param_count {
+        // 自定义参数: Lua → JNI jvalue 转换
+        let mut jargs: Vec<u64> = Vec::with_capacity(cb_ctx.param_count);
+        for i in 0..cb_ctx.param_count {
+            let lua_idx = (i + 2) as i32; // stack index 2, 3, ...
+            let type_sig = cb_ctx.param_types.get(i).map(|s| s.as_str());
+            jargs.push(lua_to_jvalue(L, lua_idx, type_sig, cb_ctx.env));
+        }
+        (jargs.as_ptr() as *const std::ffi::c_void, Some(jargs))
+    } else {
+        // 原始参数
+        (cb_ctx.jargs_ptr, None)
+    };
+
     let ret = crate::jsapi::java::callback::invoke_original_jni(
         cb_ctx.env,
         cb_ctx.art_method,
@@ -254,19 +276,75 @@ pub(crate) unsafe extern "C" fn lua_call_original(
         cb_ctx.this_obj,
         cb_ctx.return_type,
         cb_ctx.is_static,
-        cb_ctx.jargs_ptr,
+        jargs_ptr,
         cb_ctx.quick_trampoline,
         false,
     );
 
-    push_return_value(L, ret, cb_ctx.return_type);
+    // 保持 jargs_buf 存活到 invoke 完成
+    drop(jargs_buf);
+
+    push_return_value(L, ret, cb_ctx.return_type, cb_ctx.env);
     1
+}
+
+/// Lua 值 → JNI jvalue (u64)
+unsafe fn lua_to_jvalue(
+    L: *mut ffi::lua_State,
+    idx: i32,
+    type_sig: Option<&str>,
+    env: crate::jsapi::java::jni_core::JniEnv,
+) -> u64 {
+    if ffi::lua_isnil(L, idx) {
+        return 0;
+    }
+    let sig = type_sig.unwrap_or("L");
+    match sig.as_bytes()[0] {
+        b'Z' => ffi::lua_toboolean(L, idx) as u64,
+        b'B' => ffi::lua_tointeger_ex(L, idx) as i8 as u64,
+        b'C' => ffi::lua_tointeger_ex(L, idx) as u16 as u64,
+        b'S' => ffi::lua_tointeger_ex(L, idx) as i16 as u64,
+        b'I' => ffi::lua_tointeger_ex(L, idx) as i32 as u64,
+        b'J' => ffi::lua_tointeger_ex(L, idx) as u64,
+        b'F' => (ffi::lua_tonumber_ex(L, idx) as f32).to_bits() as u64,
+        b'D' => ffi::lua_tonumber_ex(L, idx).to_bits(),
+        b'L' | b'[' => {
+            let tp = ffi::lua_type(L, idx);
+            if tp == ffi::LUA_TLIGHTUSERDATA as i32 {
+                ffi::lua_touserdata(L, idx) as u64
+            } else if tp == ffi::LUA_TSTRING as i32 && !env.is_null() {
+                lua_string_to_jstring(L, idx, env)
+            } else if tp == ffi::LUA_TNUMBER as i32 {
+                ffi::lua_tointeger_ex(L, idx) as u64
+            } else {
+                0
+            }
+        }
+        _ => ffi::lua_tointeger_ex(L, idx) as u64,
+    }
+}
+
+/// Lua string → Java String (NewStringUTF)
+pub(crate) unsafe fn lua_string_to_jstring(
+    L: *mut ffi::lua_State,
+    idx: i32,
+    env: crate::jsapi::java::jni_core::JniEnv,
+) -> u64 {
+    let s = ffi::lua_tostring_ex(L, idx);
+    if s.is_null() || env.is_null() {
+        return 0;
+    }
+    let vtable = *(env as *const *const usize);
+    type NewStringUtfFn = unsafe extern "C" fn(*const std::ffi::c_void, *const std::os::raw::c_char) -> *mut std::ffi::c_void;
+    let new_string: NewStringUtfFn = std::mem::transmute(*vtable.add(167));
+    new_string(env as *const std::ffi::c_void, s) as u64
 }
 
 unsafe fn push_return_value(
     L: *mut ffi::lua_State,
     raw: u64,
     return_type: u8,
+    env: crate::jsapi::java::jni_core::JniEnv,
 ) {
     match return_type {
         b'V' => ffi::lua_pushnil(L),

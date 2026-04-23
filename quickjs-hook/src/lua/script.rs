@@ -32,9 +32,16 @@ pub fn load_lua_script(code: &str, filename: &str) -> Result<String, String> {
 
 unsafe fn register_java_api(state: &LuaState) {
     let L = state.as_ptr();
-    ffi::lua_createtable(L, 0, 1);
+    ffi::lua_createtable(L, 0, 2);
     ffi::lua_pushcfunction(L, Some(lua_java_hook));
     ffi::lua_setfield(L, -2, c"hook".as_ptr());
+    ffi::lua_pushcfunction(L, Some(lua_java_unhook));
+    ffi::lua_setfield(L, -2, c"unhook".as_ptr());
+
+    // Java.jstring(str) — Lua string → Java String
+    ffi::lua_pushcfunction(L, Some(lua_jstring));
+    ffi::lua_setfield(L, -2, c"jstring".as_ptr());
+
     ffi::lua_setglobal(L, c"Java".as_ptr());
 }
 
@@ -98,6 +105,82 @@ unsafe extern "C" fn lua_java_hook(L: *mut ffi::lua_State) -> std::os::raw::c_in
             0
         }
     }
+}
+
+/// Java.unhook(class, method, sig)
+unsafe extern "C" fn lua_java_unhook(L: *mut ffi::lua_State) -> std::os::raw::c_int {
+    if ffi::lua_gettop(L) < 3 {
+        ffi::luaL_error(L, c"Java.unhook requires 3 args: class, method, sig".as_ptr());
+        return 0;
+    }
+    let class_c = ffi::lua_tostring_ex(L, 1);
+    let method_c = ffi::lua_tostring_ex(L, 2);
+    let sig_c = ffi::lua_tostring_ex(L, 3);
+    if class_c.is_null() || method_c.is_null() || sig_c.is_null() {
+        ffi::luaL_error(L, c"Java.unhook: args must be strings".as_ptr());
+        return 0;
+    }
+    let class_name = std::ffi::CStr::from_ptr(class_c).to_string_lossy();
+    let method_name = std::ffi::CStr::from_ptr(method_c).to_string_lossy();
+    let sig = std::ffi::CStr::from_ptr(sig_c).to_string_lossy();
+
+    // 通过 JS 引擎执行 unhook (复用已有的完整 unhook 逻辑)
+    let js_cmd = format!(
+        "Java.unhook(\"{}\", \"{}\", \"{}\")",
+        class_name.replace('"', "\\\""),
+        method_name.replace('"', "\\\""),
+        sig.replace('"', "\\\""),
+    );
+    match crate::load_script(&js_cmd) {
+        Ok(_) => {
+            // 同时从 Lua registry 移除
+            // 需要 art_method 地址，通过 resolve 获取
+            crate::jsapi::console::output_message(&format!(
+                "[lua] unhooked: {}.{}{}",
+                class_name, method_name, sig
+            ));
+            ffi::lua_pushboolean(L, 1);
+        }
+        Err(e) => {
+            let cs = std::ffi::CString::new(format!("unhook failed: {}", e)).unwrap_or_default();
+            ffi::luaL_error(L, cs.as_ptr());
+        }
+    }
+    1
+}
+
+/// Java.jstring("hello") → Java String (lightuserdata)
+unsafe extern "C" fn lua_jstring(L: *mut ffi::lua_State) -> std::os::raw::c_int {
+    let s = ffi::lua_tostring_ex(L, 1);
+    if s.is_null() {
+        ffi::lua_pushnil(L);
+        return 1;
+    }
+    let env = super::api::get_current_env();
+    if env.is_null() {
+        // 没有活跃的 callback env，尝试 get_thread_env
+        match crate::jsapi::java::jni_core::get_thread_env() {
+            Ok(e) => {
+                let jstr = super::api::lua_string_to_jstring(L, 1, e);
+                if jstr != 0 {
+                    ffi::lua_pushlightuserdata(L, jstr as *mut std::ffi::c_void);
+                } else {
+                    ffi::lua_pushnil(L);
+                }
+            }
+            Err(_) => ffi::lua_pushnil(L),
+        }
+    } else {
+        // 用当前 callback 的 env
+        let e = env as crate::jsapi::java::jni_core::JniEnv;
+        let jstr = super::api::lua_string_to_jstring(L, 1, e);
+        if jstr != 0 {
+            ffi::lua_pushlightuserdata(L, jstr as *mut std::ffi::c_void);
+        } else {
+            ffi::lua_pushnil(L);
+        }
+    }
+    1
 }
 
 pub fn cleanup_master_state() {
