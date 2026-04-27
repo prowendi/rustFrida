@@ -18,6 +18,8 @@ struct DslSemanticContext {
     target_return_type: String,
     local_descriptors: BTreeMap<String, String>,
     target_narrow_types: BTreeMap<DslTargetKey, Option<String>>,
+    last_descriptor: Option<String>,
+    result_descriptor: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -113,6 +115,24 @@ impl DslSemanticContext {
             target_return_type,
             local_descriptors: BTreeMap::new(),
             target_narrow_types: BTreeMap::new(),
+            last_descriptor: None,
+            result_descriptor: None,
+        }
+    }
+
+    fn record_last_descriptor(&mut self, descriptor: String) {
+        self.last_descriptor = Some(descriptor);
+    }
+
+    fn record_result_descriptor(&mut self, descriptor: String) {
+        self.result_descriptor = Some(descriptor);
+    }
+
+    fn record_value_descriptor(&mut self, descriptor: &str) {
+        if return_is_object(descriptor) {
+            self.record_last_descriptor(descriptor.to_string());
+        } else if descriptor != "V" {
+            self.record_result_descriptor(descriptor.to_string());
         }
     }
 
@@ -137,9 +157,14 @@ impl DslSemanticContext {
                 .get(name)
                 .cloned()
                 .ok_or_else(|| format!("local '{}' is not declared", name)),
-            DslTarget::Last | DslTarget::Result => {
-                Err("target class cannot be inferred for last/result; pass the class name explicitly".to_string())
-            }
+            DslTarget::Last => self
+                .last_descriptor
+                .clone()
+                .ok_or_else(|| "last has no known object type yet".to_string()),
+            DslTarget::Result => self
+                .result_descriptor
+                .clone()
+                .ok_or_else(|| "result has no known primitive type yet".to_string()),
         }
     }
 
@@ -624,24 +649,42 @@ impl DslSemanticContext {
                 class_name,
                 ctor_sig,
                 args,
-            } => self.validate_value(&DslValue::NewObject {
-                class_name: class_name.clone(),
-                ctor_sig: ctor_sig.clone(),
-                args: args.clone(),
-            })?,
+            } => {
+                self.validate_value(&DslValue::NewObject {
+                    class_name: class_name.clone(),
+                    ctor_sig: ctor_sig.clone(),
+                    args: args.clone(),
+                })?;
+                self.record_last_descriptor(java_class_to_descriptor(class_name)?);
+            }
             DslStmt::NewArray { array_type_name, size } => {
                 let desc = java_class_to_descriptor_or_primitive(array_type_name)?;
                 if !desc.starts_with('[') {
                     return Err(format!("new array requires an array type, got '{}'", array_type_name));
                 }
                 self.validate_value(size)?;
+                self.record_last_descriptor(desc);
             }
-            DslStmt::Call(stmt) => self.validate_call(stmt)?,
+            DslStmt::Call(stmt) => {
+                self.validate_call(stmt)?;
+                let class_type = self.resolve_member_class_type(
+                    stmt.class_name.as_deref(),
+                    stmt.target.as_ref(),
+                    stmt.receiver.as_deref(),
+                )?;
+                let arg_types = self.infer_call_arg_descriptors(stmt)?;
+                let (_, return_type, _) =
+                    resolve_call_proto_with_arg_types(self.env, stmt, &class_type, Some(&arg_types))?;
+                self.record_value_descriptor(&return_type);
+            }
             DslStmt::Cast { value, class_name } => {
                 self.validate_value(value)?;
-                java_class_to_descriptor(class_name)?;
+                self.record_last_descriptor(java_class_to_descriptor(class_name)?);
             }
-            DslStmt::ArrayLength { array } => self.validate_value(array)?,
+            DslStmt::ArrayLength { array } => {
+                self.validate_value(array)?;
+                self.record_result_descriptor("I".to_string());
+            }
             DslStmt::ArrayGet {
                 array,
                 index,
@@ -650,9 +693,16 @@ impl DslSemanticContext {
                 self.validate_value(array)?;
                 self.validate_value(index)?;
                 if let Some(type_name) = type_name {
-                    java_class_to_descriptor_or_primitive(type_name)?;
+                    let component = java_class_to_descriptor_or_primitive(type_name)?;
+                    self.record_value_descriptor(&component);
                 } else if self.infer_value_descriptor(array)?.is_none() {
                     return Err("array element type cannot be inferred; use arr[index: Type]".to_string());
+                } else {
+                    let array_desc = self
+                        .infer_value_descriptor(array)?
+                        .ok_or_else(|| "array element type cannot be inferred; use arr[index: Type]".to_string())?;
+                    let component = array_component_descriptor(&array_desc)?;
+                    self.record_value_descriptor(&component);
                 }
             }
             DslStmt::ArrayPut {
@@ -668,8 +718,13 @@ impl DslSemanticContext {
                     java_class_to_descriptor_or_primitive(type_name)?;
                 }
             }
-            DslStmt::FieldRead { stmt, is_static } | DslStmt::FieldWrite { stmt, is_static } => {
-                self.validate_field(stmt, *is_static)?
+            DslStmt::FieldRead { stmt, is_static } => {
+                self.validate_field(stmt, *is_static)?;
+                let descriptor = self.resolve_field_descriptor(stmt, *is_static)?;
+                self.record_value_descriptor(&descriptor);
+            }
+            DslStmt::FieldWrite { stmt, is_static } => {
+                self.validate_field(stmt, *is_static)?;
             }
             DslStmt::IfNull {
                 value,

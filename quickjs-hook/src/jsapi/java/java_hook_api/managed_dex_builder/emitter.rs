@@ -44,6 +44,8 @@ pub(super) struct DslBuildContext {
     int_expr_scratch_count: u16,
     range_scratch_base: u16,
     target_narrow_types: BTreeMap<DslTargetKey, String>,
+    last_descriptor: Option<String>,
+    result_descriptor: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -85,6 +87,8 @@ impl DslBuildContext {
             int_expr_scratch_count,
             range_scratch_base,
             target_narrow_types: BTreeMap::new(),
+            last_descriptor: None,
+            result_descriptor: None,
         }
     }
 
@@ -146,6 +150,22 @@ impl DslBuildContext {
             }
         }
         result
+    }
+
+    fn record_last_descriptor(&mut self, descriptor: String) {
+        self.last_descriptor = Some(descriptor);
+    }
+
+    fn record_result_descriptor(&mut self, descriptor: String) {
+        self.result_descriptor = Some(descriptor);
+    }
+
+    fn record_value_descriptor(&mut self, descriptor: &str) {
+        if return_is_object(descriptor) {
+            self.record_last_descriptor(descriptor.to_string());
+        } else if descriptor != "V" {
+            self.record_result_descriptor(descriptor.to_string());
+        }
     }
 }
 
@@ -1174,9 +1194,14 @@ fn resolve_target_descriptor(
             .get(name)
             .map(|slot| slot.descriptor.clone())
             .ok_or_else(|| format!("local '{}' is not declared", name)),
-        DslTarget::Last | DslTarget::Result => {
-            Err("target class cannot be inferred for last/result; pass the class name explicitly".to_string())
-        }
+        DslTarget::Last => dsl_ctx
+            .last_descriptor
+            .clone()
+            .ok_or_else(|| "last has no known object type yet".to_string()),
+        DslTarget::Result => dsl_ctx
+            .result_descriptor
+            .clone()
+            .ok_or_else(|| "result has no known primitive type yet".to_string()),
     }
 }
 
@@ -1289,6 +1314,7 @@ fn emit_field_read(
         let obj = emit_field_receiver(ir, stmt, layout, dsl_ctx)?;
         ir.iget(dst, obj, field, kind);
     }
+    dsl_ctx.record_value_descriptor(&field_type);
     Ok(())
 }
 
@@ -1641,6 +1667,7 @@ fn emit_cast(
     if reg != REG_LAST_OBJECT {
         ir.move_from16(REG_LAST_OBJECT, reg as u16, ValueKind::Object);
     }
+    dsl_ctx.record_last_descriptor(java_class_to_descriptor(class_name)?);
     Ok(())
 }
 
@@ -1660,6 +1687,7 @@ fn emit_new_array(
     let size_reg = emit_copy_field_value_if_needed(ir, size_reg, REG_TMP0, ValueKind::Narrow);
     ir.new_array(REG_LAST_OBJECT, size_reg, array_type);
     ir.sput_object(REG_LAST_OBJECT, sink.clone());
+    dsl_ctx.record_last_descriptor(java_class_to_descriptor_or_primitive(array_type_name)?);
     Ok(())
 }
 
@@ -1670,6 +1698,7 @@ fn emit_array_length_stmt(
     dsl_ctx: &mut DslBuildContext,
 ) -> Result<(), String> {
     let _ = emit_array_length_value(ir, array, REG_RESULT, layout, dsl_ctx)?;
+    dsl_ctx.record_result_descriptor("I".to_string());
     Ok(())
 }
 
@@ -1689,6 +1718,7 @@ fn emit_array_get_stmt(
         REG_RESULT
     };
     let _ = emit_array_get_value(ir, array, index, &component_type, dst, layout, dsl_ctx)?;
+    dsl_ctx.record_value_descriptor(&component_type);
     Ok(())
 }
 
@@ -1973,6 +2003,7 @@ fn emit_call(
         dsl_ctx,
     )?;
     emit_discard_result(ir, &return_type)?;
+    dsl_ctx.record_value_descriptor(&return_type);
     Ok(method)
 }
 
@@ -2856,6 +2887,9 @@ fn emit_statement(ir: &mut DexIrBuilder, stmt: &DslStmt, emit_ctx: &mut EmitCont
                 emit_ctx.layout,
                 emit_ctx.dsl_ctx,
             )?;
+            emit_ctx
+                .dsl_ctx
+                .record_last_descriptor(java_class_to_descriptor(class_name)?);
             Ok(false)
         }
         DslStmt::NewArray { array_type_name, size } => {
@@ -2870,7 +2904,8 @@ fn emit_statement(ir: &mut DexIrBuilder, stmt: &DslStmt, emit_ctx: &mut EmitCont
             Ok(false)
         }
         DslStmt::Call(stmt) => {
-            emit_call(ir, stmt, emit_ctx.layout, emit_ctx.dsl_ctx)?;
+            let method = emit_call(ir, stmt, emit_ctx.layout, emit_ctx.dsl_ctx)?;
+            emit_ctx.dsl_ctx.record_value_descriptor(&method.proto.return_type);
             Ok(false)
         }
         DslStmt::Cast { value, class_name } => {
