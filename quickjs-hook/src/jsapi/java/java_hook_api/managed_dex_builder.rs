@@ -70,7 +70,9 @@ impl MethodRef {
 }
 
 mod dex_ir;
-use dex_ir::{value_kind_from_descriptor, DexIntBinOp, DexIntLit16Op, DexIntLit8Op, DexIrBuilder, IfCmpOp, ValueKind};
+use dex_ir::{
+    value_kind_from_descriptor, DexCode, DexIntBinOp, DexIntLit16Op, DexIntLit8Op, DexIrBuilder, IfCmpOp, ValueKind,
+};
 
 mod dex_writer;
 use dex_writer::{DexBuilder, DexClass};
@@ -80,6 +82,8 @@ pub(super) struct GeneratedManagedDex {
     pub class_name: String,
     pub method_name: String,
     pub method_sig: String,
+    pub orig_backup_name: Option<String>,
+    pub orig_backup_sig: Option<String>,
     pub uses_orig: bool,
     pub string_literals: Vec<GeneratedStringLiteral>,
 }
@@ -116,6 +120,42 @@ fn emit_return_from_orig(ir: &mut DexIrBuilder, return_type: &str) -> Result<(),
         other => return Err(format!("unsupported return type '{}'", other)),
     }
     Ok(())
+}
+
+fn build_orig_backup_stub(return_type: &str, ins_size: u16) -> Result<DexCode, String> {
+    let min_ret_regs = match return_type {
+        "V" => 0,
+        "J" | "D" => 2,
+        "Z" | "B" | "C" | "S" | "I" | "F" => 1,
+        ret if return_is_object(ret) => 1,
+        other => return Err(format!("unsupported return type '{}' for orig backup", other)),
+    };
+    let mut code = DexCode::new(ins_size.max(min_ret_regs), ins_size, 0);
+    // Keep __rf_orig as a normal managed method so helper try/catch metadata can
+    // cover the call, but make the stub too large for ART's inliner. After the
+    // helper is compiled, installation rewrites this method's quick entrypoint
+    // to the original-method trampoline, so these nops are not on the hot path.
+    for _ in 0..128 {
+        code.raw(0x0000);
+    }
+    match return_type {
+        "V" => code.raw(0x000e),
+        "J" | "D" => {
+            code.raw(0x0016);
+            code.raw(0);
+            code.raw(0x0010);
+        }
+        ret if return_is_object(ret) => {
+            code.raw(0x0012);
+            code.raw(0x0011);
+        }
+        "Z" | "B" | "C" | "S" | "I" | "F" => {
+            code.raw(0x0012);
+            code.raw(0x000f);
+        }
+        _ => unreachable!(),
+    }
+    Ok(code)
 }
 
 mod semantic;
@@ -395,8 +435,17 @@ pub(super) unsafe fn build_managed_dsl_dex(
         return_type.clone(),
         target_params.clone(),
     );
+    let orig_backup_name = "__rf_orig".to_string();
+    let orig_backup_sig = build_method_sig(&helper_params, &return_type);
+    let orig_backup = MethodRef::new(
+        generated_type.clone(),
+        orig_backup_name.clone(),
+        return_type.clone(),
+        helper_params.clone(),
+    );
     let mut ir = DexIrBuilder::new(registers_size, ins_size, outs_size);
     let layout = helper_param_layout(is_static, &target_type, &target_params, local_count, local_slots)?;
+    let target_is_interface = !is_static && descriptor_is_interface(env, &target_type);
     let mut emit_ctx = EmitContext {
         layout: &layout,
         dsl_ctx: &mut dsl_ctx,
@@ -404,6 +453,8 @@ pub(super) unsafe fn build_managed_dsl_dex(
         local_count,
         ins_size,
         target: &target,
+        orig_backup: &orig_backup,
+        target_is_interface,
         return_type: &return_type,
         sink: &sink,
     };
@@ -429,10 +480,22 @@ pub(super) unsafe fn build_managed_dsl_dex(
         ACC_PUBLIC | ACC_STATIC,
         code,
     );
+    if uses_orig {
+        class.direct_method(
+            &orig_backup_name,
+            &return_type,
+            helper_params.clone(),
+            ACC_PUBLIC | ACC_STATIC | ACC_SYNTHETIC,
+            build_orig_backup_stub(&return_type, ins_size)?,
+        );
+    }
 
     let mut builder = DexBuilder::new();
     builder.add_class(class);
     builder.add_method_ref(target);
+    if uses_orig {
+        builder.add_method_ref(orig_backup);
+    }
     let dex = builder.build()?;
 
     Ok(GeneratedManagedDex {
@@ -440,6 +503,8 @@ pub(super) unsafe fn build_managed_dsl_dex(
         class_name: generated_class_name,
         method_name: "hook".to_string(),
         method_sig: build_method_sig(&helper_params, &return_type),
+        orig_backup_name: uses_orig.then_some(orig_backup_name),
+        orig_backup_sig: uses_orig.then_some(orig_backup_sig),
         uses_orig,
         string_literals: dsl_ctx.string_literals,
     })

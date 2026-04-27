@@ -157,7 +157,7 @@ int hook_art_router_record_do_call(uint64_t method) {
         if (g_art_router_table[i].original == method) {
             __atomic_add_fetch(&g_art_router_do_call_table_hit_count, 1, __ATOMIC_RELAXED);
             __atomic_store_n(&g_art_router_last_do_call_x0, method, __ATOMIC_RELAXED);
-            return g_art_router_table[i].mode ? 1 : 2;
+            return g_art_router_table[i].mode ? (int)g_art_router_table[i].mode : 2;
         }
     }
     return 0;
@@ -429,6 +429,24 @@ static uint64_t hook_current_tpidr_el0(void) {
 
 int orig_bypass_set_current_thread(uint64_t method, uint64_t trampoline) {
     return orig_bypass_set(hook_current_tpidr_el0(), method, trampoline);
+}
+
+uint64_t orig_bypass_consume_current_thread(uint64_t method) {
+    uint64_t thread = hook_current_tpidr_el0();
+    for (int i = 0; i < ORIG_BYPASS_SLOTS; i++) {
+        OrigBypassState* slot = &g_orig_bypass[i];
+        uint64_t slot_thread = __atomic_load_n(&slot->thread, __ATOMIC_ACQUIRE);
+        if (slot_thread == thread && __atomic_load_n(&slot->method, __ATOMIC_ACQUIRE) == method) {
+            uint64_t trampoline = __atomic_load_n(&slot->trampoline, __ATOMIC_ACQUIRE);
+            __atomic_store_n(&slot->method, 0, __ATOMIC_RELEASE);
+            __atomic_store_n(&slot->trampoline, 0, __ATOMIC_RELEASE);
+            __atomic_store_n(&slot->thread, 0, __ATOMIC_RELEASE);
+            __atomic_sub_fetch(&g_orig_bypass_active, 1, __ATOMIC_RELEASE);
+            __atomic_add_fetch(&g_orig_bypass_hit, 1, __ATOMIC_RELAXED);
+            return trampoline;
+        }
+    }
+    return 0;
 }
 
 void orig_bypass_clear(uint64_t thread) {
@@ -1740,6 +1758,50 @@ void* hook_install_managed_direct_router(void* target,
     finalize_hook(entry, entry->thunk, thunk_size);
     pthread_mutex_unlock(&g_engine.lock);
     return entry->trampoline;
+}
+
+void* hook_install_managed_direct_entrypoint(void* target,
+                                             void* jni_env,
+                                             void** out_resolved_target,
+                                             uint64_t helper_method,
+                                             uint64_t helper_entry,
+                                             uint64_t original_method,
+                                             int set_orig_bypass) {
+    if (!g_engine.initialized || !target || !helper_method || !helper_entry || !original_method) {
+        return NULL;
+    }
+
+    void* resolved = resolve_art_trampoline(target, jni_env);
+    if (resolved != target) {
+        target = resolved;
+    }
+    if (out_resolved_target) {
+        *out_resolved_target = target;
+    }
+
+    pthread_mutex_lock(&g_engine.lock);
+
+    size_t thunk_alloc = 16384;
+    void* thunk = hook_alloc_near(thunk_alloc, target);
+    if (!thunk) {
+        pthread_mutex_unlock(&g_engine.lock);
+        return NULL;
+    }
+
+    size_t thunk_size = generate_managed_direct_thunk(
+        thunk, thunk_alloc, target, helper_method, helper_entry, original_method, set_orig_bypass);
+    if (thunk_size == 0) {
+        pthread_mutex_unlock(&g_engine.lock);
+        return NULL;
+    }
+
+    hook_flush_cache(thunk, thunk_size);
+    pthread_mutex_unlock(&g_engine.lock);
+
+    hook_log("[managed_direct_ep] thunk size=%zu helper=%llx entry=%llx original=%llx original_entry=%p thunk=%p",
+             thunk_size, (unsigned long long)helper_method, (unsigned long long)helper_entry,
+             (unsigned long long)original_method, target, thunk);
+    return thunk;
 }
 
 /* ============================================================================

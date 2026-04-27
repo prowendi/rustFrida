@@ -735,10 +735,41 @@ impl DslSemanticContext {
                     self.validate_stmts(stmts)?;
                 }
             }
+            DslStmt::TryCatch {
+                try_stmts,
+                catch_type,
+                catch_name,
+                catch_stmts,
+            } => {
+                self.validate_stmts(try_stmts)?;
+                let catch_descriptor = java_class_to_descriptor(catch_type)?;
+                if !return_is_object(&catch_descriptor) {
+                    return Err(format!("catch type must be an object, got {}", catch_descriptor));
+                }
+                if let Some(existing) = self.local_descriptors.get(catch_name) {
+                    if existing != &catch_descriptor {
+                        return Err(format!(
+                            "catch local '{}' type mismatch: existing {}, catch {}",
+                            catch_name, existing, catch_descriptor
+                        ));
+                    }
+                } else {
+                    self.local_descriptors.insert(catch_name.clone(), catch_descriptor);
+                }
+                self.validate_stmts(catch_stmts)?;
+            }
             DslStmt::ReturnOrig { args } => self.validate_orig_args(args)?,
             DslStmt::ReturnValue { value } => {
                 if let Some(value) = value {
                     self.validate_value(value)?;
+                }
+            }
+            DslStmt::Throw { value } => {
+                self.validate_value(value)?;
+                if let Some(desc) = self.infer_value_descriptor(value)? {
+                    if !return_is_object(&desc) {
+                        return Err(format!("throw value must be an object, got {}", desc));
+                    }
                 }
             }
         }

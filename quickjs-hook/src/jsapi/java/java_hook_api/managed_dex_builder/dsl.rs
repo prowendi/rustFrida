@@ -86,6 +86,15 @@ pub(super) enum DslStmt {
         cases: Vec<(i16, Vec<DslStmt>)>,
         default_stmts: Option<Vec<DslStmt>>,
     },
+    TryCatch {
+        try_stmts: Vec<DslStmt>,
+        catch_type: String,
+        catch_name: String,
+        catch_stmts: Vec<DslStmt>,
+    },
+    Throw {
+        value: DslValue,
+    },
     ReturnOrig {
         args: DslOrigArgs,
     },
@@ -422,11 +431,21 @@ impl<'a> DslParser<'a> {
             self.expect_char(';')?;
             return Ok(DslStmt::ReturnValue { value });
         }
+        if self.peek_ident("throw") {
+            self.expect_ident("throw")?;
+            let value = self.parse_value_arg()?;
+            self.skip_ws();
+            self.expect_char(';')?;
+            return Ok(DslStmt::Throw { value });
+        }
         if self.peek_ident("if") {
             return self.parse_js_if_statement();
         }
         if self.peek_ident("switch") {
             return self.parse_js_switch_statement();
+        }
+        if self.peek_ident("try") {
+            return self.parse_js_try_catch_statement();
         }
 
         let name = self.parse_ident()?;
@@ -700,6 +719,27 @@ impl<'a> DslParser<'a> {
             value,
             cases,
             default_stmts,
+        })
+    }
+
+    fn parse_js_try_catch_statement(&mut self) -> Result<DslStmt, String> {
+        self.expect_ident("try")?;
+        let try_stmts = self.parse_block()?;
+        self.skip_ws();
+        self.expect_ident("catch")?;
+        self.skip_ws();
+        self.expect_char('(')?;
+        let catch_type = self.parse_type_name()?;
+        self.skip_ws();
+        let catch_name = self.parse_ident()?;
+        self.skip_ws();
+        self.expect_char(')')?;
+        let catch_stmts = self.parse_block()?;
+        Ok(DslStmt::TryCatch {
+            try_stmts,
+            catch_type,
+            catch_name,
+            catch_stmts,
         })
     }
 }

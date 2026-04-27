@@ -56,9 +56,11 @@ The compiler rejects mixed return paths such as:
 "}"
 ```
 
-This restriction is deliberate. The managed direct thunk arms the per-thread
-orig bypass before entering the generated helper. Requiring every return path to
-consume that bypass prevents leaked bypass slots on high-frequency traffic.
+This restriction is deliberate. `orig()` is routed through a generated managed
+`__rf_orig` method. The helper is compiled against that normal dex call, then
+the `__rf_orig` quick entrypoint is rewritten to the original-method trampoline.
+Keeping `orig()` returns structurally simple avoids mixing the backup call path
+with unrelated direct returns on high-frequency traffic.
 
 `orig()` calls the original method with the original receiver and arguments.
 `orig(arg0, arg1)` calls the original method with explicit replacement
@@ -68,9 +70,10 @@ parameter count; instance receivers are still supplied automatically.
 The expected stable stats are:
 
 ```text
-managed == orig == set
-fail=0
-active=0
+managed > 0
+orig=0
+set=0
+bypassActive=0
 backup=0
 ```
 
@@ -335,7 +338,8 @@ Orig result path:
 
 `let x = orig(...)` is intentionally restricted: it must appear once as the first
 top-level statement, and it cannot be mixed with `return orig(...)`. This keeps
-the per-thread orig bypass consumed exactly once before any user DSL logic runs.
+the backup-orig call path deterministic before any additional user DSL logic
+runs.
 
 Direct value returns are supported only for DSL programs that do not use
 `orig()` or `orig(...)`:
@@ -345,18 +349,55 @@ Direct value returns are supported only for DSL programs that do not use
 "return 1;"
 ```
 
+### Throw
+
+Throwing Java exceptions is supported:
+
+```js
+"throw java.lang.IllegalStateException.$new(\"java.lang.String\", \"blocked\");"
+```
+
+The emitted dex casts the value to `java.lang.Throwable` before `throw`, so
+non-Throwable object values fail with normal Java cast semantics. Primitive
+values cannot be thrown.
+
+### Try / Catch
+
+`orig(...)` is emitted as a call to a generated backup method, so exceptions can
+be caught by generated dex code:
+
+```js
+"try {" +
+"  return orig(arg0);" +
+"} catch (java.lang.NumberFormatException e) {" +
+"  return 0;" +
+"}"
+```
+
+The catch variable is a typed local object and can be used inside the catch
+block:
+
+```js
+"try {" +
+"  return orig(arg0, arg1);" +
+"} catch (java.lang.RuntimeException e) {" +
+"  throw e;" +
+"}"
+```
+
 ## Current Limits
 
 - `return orig(...)` cannot be mixed with `return null`, `return value`, or
-  fall-through return paths.
+  fall-through return paths on normal control flow. Catch blocks may return a
+  fallback value for an exception thrown by `orig(...)`.
 - `let x = orig(...)` must be the first top-level statement and cannot be nested.
 - Local variable type inference uses the static descriptor of the expression.
   Use `let name: Type = value` when inference is impossible, for example `null`.
 - `switch` supports integer case constants only. Case bodies must use `{ ... }`,
   and fallthrough/break are not part of the DSL.
 - Loops are not part of the JS-like managed DSL.
-- Try/catch, throw, monitor enter/exit, and synchronized blocks are not part of
-  the DSL.
+- Only one catch handler is currently emitted per generated method.
+- Monitor enter/exit and synchronized blocks are not part of the DSL.
 - Complex object lifetime rules should stay inside generated managed code.
   Avoid JS/Lua callbacks on hot methods.
 - Reflection-style Java APIs from JS/Lua are not the high-frequency path. Use
@@ -419,11 +460,11 @@ adb -s <device> logcat -d -v time | rg -i \
 Successful validation should show the route stats closed:
 
 ```text
-managed=354184,orig=354184,set=354184,fail=0,active=0,backup=0
+managed=354184,orig=0,set=0,fail=0,active=0,backup=0
 ```
 
 The exact count varies with app traffic. The important conditions are equal
-`managed`, `orig`, and `set` counts, zero failures, zero active bypass slots, no
+`managed > 0`, zero orig-bypass hits/sets/failures, zero active bypass slots, no
 backup stub hits, and no ANR/SuspendAll/SIGSEGV/fatal signal in logcat.
 
 ## Local Acceptance Scripts

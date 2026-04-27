@@ -209,6 +209,9 @@ impl DexBuilder {
         for class in &self.classes {
             for method in class.direct_methods.iter().chain(class.virtual_methods.iter()) {
                 if let Some(code) = &method.code {
+                    for item in &code.try_items {
+                        type_set.insert(item.handler_type.clone());
+                    }
                     for word in &code.insns {
                         match word {
                             CodeWord::String(value) => {
@@ -504,7 +507,7 @@ fn write_code_item(
     write_u16(out, code.registers_size);
     write_u16(out, code.ins_size);
     write_u16(out, code.outs_size);
-    write_u16(out, 0);
+    write_u16(out, code.try_items.len() as u16);
     write_u32(out, 0);
     write_u32(out, code.insns.len() as u32);
     for word in &code.insns {
@@ -514,6 +517,31 @@ fn write_code_item(
             CodeWord::Type(ty) => write_u16(out, lookup_u16(type_idx, ty, "type")?),
             CodeWord::Field(field) => write_u16(out, lookup_u16(field_idx, field, "field")?),
             CodeWord::Method(method) => write_u16(out, lookup_u16(method_idx, method, "method")?),
+        }
+    }
+    if !code.try_items.is_empty() {
+        if code.insns.len() % 2 != 0 {
+            write_u16(out, 0);
+        }
+        for item in &code.try_items {
+            write_u32(out, item.start_addr);
+            write_u16(out, item.insn_count);
+            write_u16(out, 1);
+        }
+        write_uleb128(out, 1);
+        write_sleb128(out, 1);
+        let first = &code.try_items[0];
+        write_uleb128(
+            out,
+            *type_idx
+                .get(&first.handler_type)
+                .ok_or_else(|| format!("missing catch type index for {}", first.handler_type))?,
+        );
+        write_uleb128(out, first.handler_addr);
+        for item in code.try_items.iter().skip(1) {
+            if item.handler_type != first.handler_type || item.handler_addr != first.handler_addr {
+                return Err("only one catch handler is currently supported per generated method".to_string());
+            }
         }
     }
     Ok(())
@@ -562,18 +590,13 @@ fn write_map_list(out: &mut Vec<u8>, entries: &[(u16, u32, u32)]) {
 
 fn uleb128_padded5(mut value: u32) -> [u8; 5] {
     let mut out = [0u8; 5];
-    let mut i = 0;
-    loop {
+    for (i, slot) in out.iter_mut().enumerate() {
         let mut byte = (value & 0x7f) as u8;
         value >>= 7;
-        if value != 0 {
+        if i != 4 {
             byte |= 0x80;
         }
-        out[i] = byte;
-        i += 1;
-        if value == 0 {
-            break;
-        }
+        *slot = byte;
     }
     out
 }
@@ -587,6 +610,18 @@ fn write_uleb128(out: &mut Vec<u8>, mut value: u32) {
         }
         out.push(byte);
         if value == 0 {
+            break;
+        }
+    }
+}
+
+fn write_sleb128(out: &mut Vec<u8>, mut value: i32) {
+    loop {
+        let byte = (value as u8) & 0x7f;
+        value >>= 7;
+        let done = (value == 0 && (byte & 0x40) == 0) || (value == -1 && (byte & 0x40) != 0);
+        out.push(if done { byte } else { byte | 0x80 });
+        if done {
             break;
         }
     }

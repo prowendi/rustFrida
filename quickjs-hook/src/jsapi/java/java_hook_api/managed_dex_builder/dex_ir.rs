@@ -6,6 +6,7 @@ pub(in crate::jsapi::java::java_hook_api) struct DexCode {
     pub ins_size: u16,
     pub outs_size: u16,
     pub insns: Vec<CodeWord>,
+    pub try_items: Vec<DexTryItem>,
 }
 
 impl DexCode {
@@ -15,6 +16,7 @@ impl DexCode {
             ins_size,
             outs_size,
             insns: Vec::new(),
+            try_items: Vec::new(),
         }
     }
 
@@ -39,6 +41,14 @@ impl DexCode {
     }
 }
 
+#[derive(Clone, Debug)]
+pub(in crate::jsapi::java::java_hook_api) struct DexTryItem {
+    pub start_addr: u32,
+    pub insn_count: u16,
+    pub handler_type: String,
+    pub handler_addr: u32,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(super) struct DexLabel(usize);
 
@@ -48,6 +58,7 @@ pub(super) struct DexIrBuilder {
     outs_size: u16,
     instrs: Vec<IrInstr>,
     labels: Vec<Option<usize>>,
+    try_items: Vec<IrTryItem>,
 }
 
 impl DexIrBuilder {
@@ -58,6 +69,7 @@ impl DexIrBuilder {
             outs_size,
             instrs: Vec::new(),
             labels: Vec::new(),
+            try_items: Vec::new(),
         }
     }
 
@@ -97,6 +109,10 @@ impl DexIrBuilder {
 
     pub(super) fn move_from16(&mut self, dst: u8, src: u16, kind: ValueKind) {
         self.instrs.push(IrInstr::MoveFrom16 { dst, src, kind });
+    }
+
+    pub(super) fn move_exception(&mut self, dst: u8) {
+        self.instrs.push(IrInstr::MoveException { dst });
     }
 
     pub(super) fn if_cmp(&mut self, op: IfCmpOp, left: u8, right: u8, target: DexLabel) {
@@ -292,6 +308,19 @@ impl DexIrBuilder {
         self.instrs.push(IrInstr::ReturnVoid);
     }
 
+    pub(super) fn throw_value(&mut self, src: u8) {
+        self.instrs.push(IrInstr::Throw { src });
+    }
+
+    pub(super) fn add_try_item(&mut self, start: DexLabel, end: DexLabel, handler_type: String, handler: DexLabel) {
+        self.try_items.push(IrTryItem {
+            start,
+            end,
+            handler_type,
+            handler,
+        });
+    }
+
     pub(super) fn finish(self) -> Result<DexCode, String> {
         let mut offsets = Vec::with_capacity(self.instrs.len());
         let mut offset = 0usize;
@@ -310,6 +339,26 @@ impl DexIrBuilder {
         for (idx, instr) in self.instrs.into_iter().enumerate() {
             instr.emit(&mut code, offsets[idx], &self.labels)?;
         }
+        for item in self.try_items {
+            let start_addr = label_offset(item.start, &self.labels, "try start")? as u32;
+            let end_addr = label_offset(item.end, &self.labels, "try end")?;
+            if end_addr < start_addr as usize {
+                return Err("try end is before try start".to_string());
+            }
+            let insn_count = end_addr - start_addr as usize;
+            if insn_count == 0 {
+                return Err("try block cannot be empty".to_string());
+            }
+            if insn_count > u16::MAX as usize {
+                return Err(format!("try block too large: {} code units", insn_count));
+            }
+            code.try_items.push(DexTryItem {
+                start_addr,
+                insn_count: insn_count as u16,
+                handler_type: item.handler_type,
+                handler_addr: label_offset(item.handler, &self.labels, "catch handler")? as u32,
+            });
+        }
         Ok(code)
     }
 
@@ -320,6 +369,13 @@ impl DexIrBuilder {
         }
         offset
     }
+}
+
+struct IrTryItem {
+    start: DexLabel,
+    end: DexLabel,
+    handler_type: String,
+    handler: DexLabel,
 }
 
 enum IrInstr {
@@ -339,6 +395,9 @@ enum IrInstr {
         dst: u8,
         src: u16,
         kind: ValueKind,
+    },
+    MoveException {
+        dst: u8,
     },
     IfCmp {
         op: IfCmpOp,
@@ -501,6 +560,9 @@ enum IrInstr {
     ReturnObject {
         src: u8,
     },
+    Throw {
+        src: u8,
+    },
     ReturnVoid,
 }
 
@@ -649,6 +711,7 @@ impl IrInstr {
             IrInstr::Const16 { .. } => 2,
             IrInstr::ConstString { .. } => 2,
             IrInstr::MoveFrom16 { .. } => 2,
+            IrInstr::MoveException { .. } => 1,
             IrInstr::IfCmp { .. } => 2,
             IrInstr::IfEqz { .. } | IrInstr::IfNez { .. } => 2,
             IrInstr::Goto16 { .. } => 2,
@@ -675,6 +738,7 @@ impl IrInstr {
             IrInstr::MoveResultObject { .. } => 1,
             IrInstr::Return { .. } | IrInstr::ReturnWide { .. } => 1,
             IrInstr::ReturnObject { .. } => 1,
+            IrInstr::Throw { .. } => 1,
             IrInstr::ReturnVoid => 1,
         }
     }
@@ -709,6 +773,10 @@ impl IrInstr {
                 };
                 code.raw(opcode | ((dst as u16) << 8));
                 code.raw(src);
+            }
+            IrInstr::MoveException { dst } => {
+                require_byte(dst, "move-exception dst")?;
+                code.raw(0x000d | ((dst as u16) << 8));
             }
             IrInstr::IfCmp {
                 op,
@@ -945,6 +1013,10 @@ impl IrInstr {
                 require_byte(src, "return-object src")?;
                 code.raw(0x0011 | ((src as u16) << 8));
             }
+            IrInstr::Throw { src } => {
+                require_byte(src, "throw src")?;
+                code.raw(0x0027 | ((src as u16) << 8));
+            }
             IrInstr::ReturnVoid => {
                 code.raw(0x000e);
             }
@@ -1075,6 +1147,13 @@ fn branch_offset(
         return Err(format!("{} branch offset out of range: {}", opname, delta));
     }
     Ok(delta as i16)
+}
+
+fn label_offset(target: DexLabel, labels: &[Option<usize>], opname: &str) -> Result<usize, String> {
+    labels
+        .get(target.0)
+        .and_then(|v| *v)
+        .ok_or_else(|| format!("{} label {} is not bound", opname, target.0))
 }
 
 fn branch_offset_i32(

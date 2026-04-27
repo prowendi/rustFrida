@@ -903,6 +903,9 @@ unsafe extern "C" fn on_do_call_enter(ctx_ptr: *mut hook_ffi::HookContext, user_
         DO_CALL_HIT_COUNT.fetch_add(1, Ordering::Relaxed);
         // 递归防护: TLS bypass (callOriginal) + managed stack check
         ensure_bypass_key();
+        if hook_ffi::orig_bypass_consume_current_thread(method) != 0 {
+            return; // managed helper orig() bypass — one-shot, let original DoCall run
+        }
         let bypass = libc::pthread_getspecific(BYPASS_KEY) as u64;
         if bypass == method {
             return; // callOriginal bypass — 仍走 tail-jump (intercept_leave=0)
@@ -910,11 +913,13 @@ unsafe extern "C" fn on_do_call_enter(ctx_ptr: *mut hook_ffi::HookContext, user_
         if !should_replace_for_stack(replacement) {
             return; // managed stack 递归 — 走 tail-jump
         }
-        // 同步 declaring_class_: replacement (malloc'd) 不被 GC 追踪，
-        // GC 移动 declaring class 后 replacement 的 declaring_class_ 可能 stale。
-        // 每次替换前从 original 拷贝到 replacement，消除竞态。
-        let dc = std::ptr::read_volatile(method as *const u32);
-        std::ptr::write_volatile(replacement as *mut u32, dc);
+        if route_mode != 4 {
+            // 同步 declaring_class_: replacement (malloc'd) 不被 GC 追踪，
+            // GC 移动 declaring class 后 replacement 的 declaring_class_ 可能 stale。
+            // Managed DSL 的 replacement 是真实 dex 方法，declaring_class_ 必须保持 helper 类。
+            let dc = std::ptr::read_volatile(method as *const u32);
+            std::ptr::write_volatile(replacement as *mut u32, dc);
+        }
         ctx.x[0] = replacement;
         // hit → 需要 wrap, 这样 thunk counter / java_hook_callback 能覆盖
         // replacement 整个执行期, drain 才能保证 "所有 replacement 退出".
@@ -968,7 +973,16 @@ unsafe fn should_replace_for_stack(replacement: u64) -> bool {
     let top_qf = std::ptr::read_volatile((managed_stack + ms_spec.top_quick_frame_offset) as *const u64);
 
     if top_qf != 0 {
-        // top_quick_frame != NULL → 正常调用 (有 compiled frame)，执行替换
+        // Compiled helper -> orig() 递归时，top_quick_frame 指向 helper frame。
+        // 直接识别 replacement frame 并放行原方法，避免 helper 调 orig 再次被替换。
+        let frame_ptr = (top_qf & !1u64) & PAC_STRIP_MASK;
+        if frame_ptr != 0 {
+            let art_method_on_stack = std::ptr::read_volatile(frame_ptr as *const u64) & PAC_STRIP_MASK;
+            if art_method_on_stack == replacement {
+                return false;
+            }
+        }
+        // top_quick_frame != NULL 且不是 replacement → 正常调用，执行替换
         return true;
     }
 

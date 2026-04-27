@@ -375,7 +375,8 @@ uint64_t hook_art_router_table_lookup_original(uint64_t replacement);
 /*
  * Debug/statistics: called from ART DoCall hook to record whether an interpreted
  * call targets an ArtMethod currently present in the C router table.
- * Returns 1 for quick callback entries, 2 for replacement entries, 0 if absent.
+ * Returns the non-zero router mode for quick/managed entries, 2 for plain
+ * replacement entries, 0 if absent.
  */
 int hook_art_router_record_do_call(uint64_t method);
 
@@ -402,6 +403,7 @@ extern volatile uint64_t g_orig_bypass_set_fail;    /* debug counter */
  *   Returns 0 on success, -1 if all slots are busy (fallback to TLS bypass).
  * orig_bypass_clear: release the slot for the given thread. */
 int orig_bypass_set(uint64_t thread, uint64_t method, uint64_t trampoline);
+uint64_t orig_bypass_consume_current_thread(uint64_t method);
 void orig_bypass_clear(uint64_t thread);
 
 /* BLR fast $orig: post-callback flag slots (separate from entry bypass).
@@ -520,6 +522,14 @@ void* hook_install_managed_direct_router(void* target,
                                          uint64_t helper_entry,
                                          uint64_t original_method,
                                          int set_orig_bypass);
+
+void* hook_install_managed_direct_entrypoint(void* target,
+                                             void* jni_env,
+                                             void** out_resolved_target,
+                                             uint64_t helper_method,
+                                             uint64_t helper_entry,
+                                             uint64_t original_method,
+                                             int set_orig_bypass);
 
 /*
  * Return the generated ART router thunk body for a hooked quickCode target.

@@ -1751,6 +1751,8 @@ fn emit_if_instance_of(
                 local_count: emit_ctx.local_count,
                 ins_size: emit_ctx.ins_size,
                 target: emit_ctx.target,
+                orig_backup: emit_ctx.orig_backup,
+                target_is_interface: emit_ctx.target_is_interface,
                 return_type: emit_ctx.return_type,
                 sink: emit_ctx.sink,
             };
@@ -2065,7 +2067,11 @@ fn stmt_int_expr_scratch_count(stmt: &DslStmt) -> u16 {
             }
             count
         }
+        DslStmt::TryCatch {
+            try_stmts, catch_stmts, ..
+        } => statements_int_expr_scratch_count(try_stmts).max(statements_int_expr_scratch_count(catch_stmts)),
         DslStmt::ReturnValue { value } => value.as_ref().map(value_int_expr_scratch_count).unwrap_or(0),
+        DslStmt::Throw { value } => value_int_expr_scratch_count(value),
     }
 }
 
@@ -2140,104 +2146,110 @@ fn condition_int_expr_scratch_count(condition: &DslCondition) -> u16 {
 fn statements_max_invoke_words(stmts: &[DslStmt], target_params: &[String], is_static: bool) -> Result<u16, String> {
     let mut max_words = 0u16;
     for stmt in stmts {
-        let words = match stmt {
-            DslStmt::Block(stmts) => statements_max_invoke_words(stmts, target_params, is_static)?,
-            DslStmt::Let { value, .. } | DslStmt::Assign { value, .. } => value_max_invoke_words(value)?,
-            DslStmt::LetOrig { args, .. } => orig_args_max_invoke_words(args, target_params, is_static)?,
-            DslStmt::New { ctor_sig, args, .. } => {
-                let params = if let Some(sig) = ctor_sig {
-                    let (params, return_type) = parse_method_signature(sig)?;
-                    if return_type != "V" {
-                        return Err(format!("constructor signature must return void, got '{}'", return_type));
+        let words =
+            match stmt {
+                DslStmt::Block(stmts) => statements_max_invoke_words(stmts, target_params, is_static)?,
+                DslStmt::Let { value, .. } | DslStmt::Assign { value, .. } => value_max_invoke_words(value)?,
+                DslStmt::LetOrig { args, .. } => orig_args_max_invoke_words(args, target_params, is_static)?,
+                DslStmt::New { ctor_sig, args, .. } => {
+                    let params = if let Some(sig) = ctor_sig {
+                        let (params, return_type) = parse_method_signature(sig)?;
+                        if return_type != "V" {
+                            return Err(format!("constructor signature must return void, got '{}'", return_type));
+                        }
+                        params
+                    } else {
+                        Vec::new()
+                    };
+                    let mut words = invoke_arg_words(true, &params)?;
+                    for arg in args {
+                        words = words.max(value_max_invoke_words(arg)?);
                     }
-                    params
-                } else {
-                    Vec::new()
-                };
-                let mut words = invoke_arg_words(true, &params)?;
-                for arg in args {
-                    words = words.max(value_max_invoke_words(arg)?);
+                    words
                 }
-                words
-            }
-            DslStmt::NewArray { size, .. } => value_max_invoke_words(size)?,
-            DslStmt::Call(stmt) => {
-                let mut words = call_stmt_max_direct_words(stmt)?;
-                for arg in &stmt.args {
-                    words = words.max(value_max_invoke_words(arg)?);
+                DslStmt::NewArray { size, .. } => value_max_invoke_words(size)?,
+                DslStmt::Call(stmt) => {
+                    let mut words = call_stmt_max_direct_words(stmt)?;
+                    for arg in &stmt.args {
+                        words = words.max(value_max_invoke_words(arg)?);
+                    }
+                    if let Some(receiver) = &stmt.receiver {
+                        words = words.max(value_max_invoke_words(receiver)?);
+                    }
+                    words
                 }
-                if let Some(receiver) = &stmt.receiver {
-                    words = words.max(value_max_invoke_words(receiver)?);
+                DslStmt::IfNull {
+                    value,
+                    then_stmts,
+                    else_stmts,
+                    ..
+                } => value_max_invoke_words(value)?
+                    .max(statements_max_invoke_words(then_stmts, target_params, is_static)?)
+                    .max(statements_max_invoke_words(else_stmts, target_params, is_static)?),
+                DslStmt::IfBool {
+                    value,
+                    then_stmts,
+                    else_stmts,
+                } => value_max_invoke_words(value)?
+                    .max(statements_max_invoke_words(then_stmts, target_params, is_static)?)
+                    .max(statements_max_invoke_words(else_stmts, target_params, is_static)?),
+                DslStmt::IfCmp {
+                    left,
+                    right,
+                    then_stmts,
+                    else_stmts,
+                    ..
+                } => value_max_invoke_words(left)?
+                    .max(value_max_invoke_words(right)?)
+                    .max(statements_max_invoke_words(then_stmts, target_params, is_static)?)
+                    .max(statements_max_invoke_words(else_stmts, target_params, is_static)?),
+                DslStmt::IfInstanceOf {
+                    value,
+                    then_stmts,
+                    else_stmts,
+                    ..
+                } => value_max_invoke_words(value)?
+                    .max(statements_max_invoke_words(then_stmts, target_params, is_static)?)
+                    .max(statements_max_invoke_words(else_stmts, target_params, is_static)?),
+                DslStmt::Switch {
+                    value,
+                    cases,
+                    default_stmts,
+                } => {
+                    let mut words = value_max_invoke_words(value)?;
+                    for (_, stmts) in cases {
+                        words = words.max(statements_max_invoke_words(stmts, target_params, is_static)?);
+                    }
+                    if let Some(stmts) = default_stmts {
+                        words = words.max(statements_max_invoke_words(stmts, target_params, is_static)?);
+                    }
+                    words
                 }
-                words
-            }
-            DslStmt::IfNull {
-                value,
-                then_stmts,
-                else_stmts,
-                ..
-            } => value_max_invoke_words(value)?
-                .max(statements_max_invoke_words(then_stmts, target_params, is_static)?)
-                .max(statements_max_invoke_words(else_stmts, target_params, is_static)?),
-            DslStmt::IfBool {
-                value,
-                then_stmts,
-                else_stmts,
-            } => value_max_invoke_words(value)?
-                .max(statements_max_invoke_words(then_stmts, target_params, is_static)?)
-                .max(statements_max_invoke_words(else_stmts, target_params, is_static)?),
-            DslStmt::IfCmp {
-                left,
-                right,
-                then_stmts,
-                else_stmts,
-                ..
-            } => value_max_invoke_words(left)?
-                .max(value_max_invoke_words(right)?)
-                .max(statements_max_invoke_words(then_stmts, target_params, is_static)?)
-                .max(statements_max_invoke_words(else_stmts, target_params, is_static)?),
-            DslStmt::IfInstanceOf {
-                value,
-                then_stmts,
-                else_stmts,
-                ..
-            } => value_max_invoke_words(value)?
-                .max(statements_max_invoke_words(then_stmts, target_params, is_static)?)
-                .max(statements_max_invoke_words(else_stmts, target_params, is_static)?),
-            DslStmt::Switch {
-                value,
-                cases,
-                default_stmts,
-            } => {
-                let mut words = value_max_invoke_words(value)?;
-                for (_, stmts) in cases {
-                    words = words.max(statements_max_invoke_words(stmts, target_params, is_static)?);
+                DslStmt::TryCatch {
+                    try_stmts, catch_stmts, ..
+                } => statements_max_invoke_words(try_stmts, target_params, is_static)?
+                    .max(statements_max_invoke_words(catch_stmts, target_params, is_static)?),
+                DslStmt::Cast { value, .. } => value_max_invoke_words(value)?,
+                DslStmt::ArrayLength { array } => value_max_invoke_words(array)?,
+                DslStmt::ArrayGet { array, index, .. } => {
+                    value_max_invoke_words(array)?.max(value_max_invoke_words(index)?)
                 }
-                if let Some(stmts) = default_stmts {
-                    words = words.max(statements_max_invoke_words(stmts, target_params, is_static)?);
-                }
-                words
-            }
-            DslStmt::Cast { value, .. } => value_max_invoke_words(value)?,
-            DslStmt::ArrayLength { array } => value_max_invoke_words(array)?,
-            DslStmt::ArrayGet { array, index, .. } => {
-                value_max_invoke_words(array)?.max(value_max_invoke_words(index)?)
-            }
-            DslStmt::ArrayPut {
-                array, index, value, ..
-            } => value_max_invoke_words(array)?
-                .max(value_max_invoke_words(index)?)
-                .max(value_max_invoke_words(value)?),
-            DslStmt::FieldRead { stmt, .. } => stmt.target.as_ref().map(|_| 0).unwrap_or(0),
-            DslStmt::FieldWrite { stmt, .. } => stmt
-                .value
-                .as_ref()
-                .map(value_max_invoke_words)
-                .transpose()?
-                .unwrap_or(0),
-            DslStmt::ReturnOrig { args } => orig_args_max_invoke_words(args, target_params, is_static)?,
-            DslStmt::ReturnValue { value } => value.as_ref().map(value_max_invoke_words).transpose()?.unwrap_or(0),
-        };
+                DslStmt::ArrayPut {
+                    array, index, value, ..
+                } => value_max_invoke_words(array)?
+                    .max(value_max_invoke_words(index)?)
+                    .max(value_max_invoke_words(value)?),
+                DslStmt::FieldRead { stmt, .. } => stmt.target.as_ref().map(|_| 0).unwrap_or(0),
+                DslStmt::FieldWrite { stmt, .. } => stmt
+                    .value
+                    .as_ref()
+                    .map(value_max_invoke_words)
+                    .transpose()?
+                    .unwrap_or(0),
+                DslStmt::ReturnOrig { args } => orig_args_max_invoke_words(args, target_params, is_static)?,
+                DslStmt::ReturnValue { value } => value.as_ref().map(value_max_invoke_words).transpose()?.unwrap_or(0),
+                DslStmt::Throw { value } => value_max_invoke_words(value)?,
+            };
         max_words = max_words.max(words);
     }
     Ok(max_words)
@@ -2376,6 +2388,9 @@ fn stmt_uses_orig(stmt: &DslStmt) -> bool {
                     .map(|stmts| statements_use_orig(stmts))
                     .unwrap_or(false)
         }
+        DslStmt::TryCatch {
+            try_stmts, catch_stmts, ..
+        } => statements_use_orig(try_stmts) || statements_use_orig(catch_stmts),
         _ => false,
     }
 }
@@ -2398,6 +2413,10 @@ fn analyze_return_flow(stmts: &[DslStmt]) -> ReturnFlow {
             DslStmt::ReturnValue { .. } => ReturnFlow {
                 falls_through: false,
                 has_non_orig_return: true,
+            },
+            DslStmt::Throw { .. } => ReturnFlow {
+                falls_through: false,
+                has_non_orig_return: false,
             },
             DslStmt::IfNull {
                 then_stmts, else_stmts, ..
@@ -2438,6 +2457,16 @@ fn analyze_return_flow(stmts: &[DslStmt]) -> ReturnFlow {
                     has_non_orig_return,
                 }
             }
+            DslStmt::TryCatch {
+                try_stmts, catch_stmts, ..
+            } => {
+                let try_flow = analyze_return_flow(try_stmts);
+                let catch_flow = analyze_return_flow(catch_stmts);
+                ReturnFlow {
+                    falls_through: try_flow.falls_through || catch_flow.falls_through,
+                    has_non_orig_return: try_flow.has_non_orig_return,
+                }
+            }
             _ => ReturnFlow {
                 falls_through: true,
                 has_non_orig_return: false,
@@ -2464,7 +2493,7 @@ pub(super) fn validate_orig_bypass_flow(program: &DslProgram) -> Result<(), Stri
     let flow = analyze_return_flow(&program.stmts);
     if flow.has_non_orig_return || flow.falls_through {
         return Err(
-            "managed DSL uses orig(); every return path must end with return orig() or return orig(...) for high-frequency direct bypass"
+            "managed DSL uses orig(); every return path must end with return orig() or return orig(...) for high-frequency backup-orig routing"
                 .to_string(),
         );
     }
@@ -2507,6 +2536,12 @@ fn program_uses_orig_value(program: &DslProgram) -> Result<bool, String> {
                         visit(stmts, true, count)?;
                     }
                 }
+                DslStmt::TryCatch {
+                    try_stmts, catch_stmts, ..
+                } => {
+                    visit(try_stmts, true, count)?;
+                    visit(catch_stmts, true, count)?;
+                }
                 _ => {}
             }
         }
@@ -2546,6 +2581,9 @@ fn statements_contain_return_orig(stmts: &[DslStmt]) -> bool {
                     .map(|stmts| statements_contain_return_orig(stmts))
                     .unwrap_or(false)
         }
+        DslStmt::TryCatch {
+            try_stmts, catch_stmts, ..
+        } => statements_contain_return_orig(try_stmts) || statements_contain_return_orig(catch_stmts),
         _ => false,
     })
 }
@@ -2598,6 +2636,8 @@ pub(super) struct EmitContext<'a> {
     pub(super) local_count: u16,
     pub(super) ins_size: u16,
     pub(super) target: &'a MethodRef,
+    pub(super) orig_backup: &'a MethodRef,
+    pub(super) target_is_interface: bool,
     pub(super) return_type: &'a str,
     pub(super) sink: &'a FieldRef,
 }
@@ -2605,11 +2645,11 @@ pub(super) struct EmitContext<'a> {
 fn emit_orig_invoke(ir: &mut DexIrBuilder, args: &DslOrigArgs, emit_ctx: &mut EmitContext<'_>) -> Result<(), String> {
     match args {
         DslOrigArgs::Original => {
-            if emit_ctx.is_static {
-                ir.invoke_static_range(emit_ctx.local_count, emit_ctx.ins_size as u8, emit_ctx.target.clone());
-            } else {
-                ir.invoke_virtual_range(emit_ctx.local_count, emit_ctx.ins_size as u8, emit_ctx.target.clone());
-            }
+            ir.invoke_static_range(
+                emit_ctx.local_count,
+                emit_ctx.ins_size as u8,
+                emit_ctx.orig_backup.clone(),
+            );
         }
         DslOrigArgs::Values(values) => {
             if values.len() != emit_ctx.layout.arg_descriptors.len() {
@@ -2619,34 +2659,37 @@ fn emit_orig_invoke(ir: &mut DexIrBuilder, args: &DslOrigArgs, emit_ctx: &mut Em
                     values.len()
                 ));
             }
-            let receiver = if emit_ctx.is_static {
-                None
+            let (kind, receiver, params, call_args) = if emit_ctx.is_static {
+                (
+                    ManagedInvokeKind::Static,
+                    None,
+                    emit_ctx.layout.arg_descriptors.clone(),
+                    values.as_slice(),
+                )
             } else {
-                Some((
-                    emit_ctx
-                        .layout
-                        .this_reg
-                        .ok_or_else(|| "missing this register for orig(...)".to_string())?,
-                    emit_ctx
-                        .layout
-                        .this_descriptor
-                        .as_deref()
-                        .ok_or_else(|| "missing this descriptor for orig(...)".to_string())?,
-                ))
+                let this_desc = emit_ctx
+                    .layout
+                    .this_descriptor
+                    .as_deref()
+                    .ok_or_else(|| "missing this descriptor for orig(...)".to_string())?;
+                let this_reg = emit_ctx
+                    .layout
+                    .this_reg
+                    .ok_or_else(|| "missing this register for orig(...)".to_string())?;
+                (
+                    ManagedInvokeKind::Static,
+                    Some((this_reg, this_desc)),
+                    emit_ctx.layout.arg_descriptors.clone(),
+                    values.as_slice(),
+                )
             };
-            let kind = if emit_ctx.is_static {
-                ManagedInvokeKind::Static
-            } else {
-                ManagedInvokeKind::Virtual
-            };
-            let params = emit_ctx.layout.arg_descriptors.clone();
             emit_invoke_with_values(
                 ir,
                 kind,
-                emit_ctx.target.clone(),
+                emit_ctx.orig_backup.clone(),
                 receiver,
                 &params,
-                values,
+                call_args,
                 emit_ctx.layout,
                 emit_ctx.dsl_ctx,
             )?;
@@ -2726,6 +2769,62 @@ fn emit_return_value(
         other => return Err(format!("unsupported direct return type '{}'", other)),
     }
     Ok(())
+}
+
+fn emit_throw(ir: &mut DexIrBuilder, value: &DslValue, emit_ctx: &mut EmitContext<'_>) -> Result<(), String> {
+    let reg = emit_load_value(
+        ir,
+        value,
+        "Ljava/lang/Object;",
+        REG_TMP0,
+        emit_ctx.layout,
+        emit_ctx.dsl_ctx,
+    )?;
+    ir.check_cast(reg, "Ljava/lang/Throwable;");
+    ir.throw_value(reg);
+    Ok(())
+}
+
+fn emit_try_catch(
+    ir: &mut DexIrBuilder,
+    try_stmts: &[DslStmt],
+    catch_type: &str,
+    catch_name: &str,
+    catch_stmts: &[DslStmt],
+    emit_ctx: &mut EmitContext<'_>,
+) -> Result<bool, String> {
+    let catch_descriptor = java_class_to_descriptor(catch_type)?;
+    let catch_slot = emit_ctx
+        .layout
+        .local_regs
+        .get(catch_name)
+        .ok_or_else(|| format!("catch local '{}' is not allocated", catch_name))?;
+    if catch_slot.descriptor != catch_descriptor {
+        return Err(format!(
+            "catch local '{}' type mismatch: declared {}, emitted {}",
+            catch_name, catch_slot.descriptor, catch_descriptor
+        ));
+    }
+
+    let try_start = ir.new_label();
+    let try_end = ir.new_label();
+    let catch_handler = ir.new_label();
+    let done = ir.new_label();
+
+    ir.bind(try_start)?;
+    let try_returns = emit_statements(ir, try_stmts, emit_ctx)?;
+    ir.bind(try_end)?;
+    if !try_returns {
+        ir.goto16(done);
+    }
+
+    ir.bind(catch_handler)?;
+    ir.move_exception(catch_slot.reg);
+    let catch_returns = emit_statements(ir, catch_stmts, emit_ctx)?;
+    ir.bind(done)?;
+    ir.add_try_item(try_start, try_end, catch_descriptor, catch_handler);
+
+    Ok(try_returns && catch_returns)
 }
 
 fn emit_statement(ir: &mut DexIrBuilder, stmt: &DslStmt, emit_ctx: &mut EmitContext<'_>) -> Result<bool, String> {
@@ -2851,12 +2950,22 @@ fn emit_statement(ir: &mut DexIrBuilder, stmt: &DslStmt, emit_ctx: &mut EmitCont
             cases,
             default_stmts,
         } => emit_switch(ir, value, cases, default_stmts.as_deref(), emit_ctx),
+        DslStmt::TryCatch {
+            try_stmts,
+            catch_type,
+            catch_name,
+            catch_stmts,
+        } => emit_try_catch(ir, try_stmts, catch_type, catch_name, catch_stmts, emit_ctx),
         DslStmt::ReturnOrig { args } => {
             emit_return_orig(ir, args, emit_ctx)?;
             Ok(true)
         }
         DslStmt::ReturnValue { value } => {
             emit_return_value(ir, value.as_ref(), emit_ctx)?;
+            Ok(true)
+        }
+        DslStmt::Throw { value } => {
+            emit_throw(ir, value, emit_ctx)?;
             Ok(true)
         }
     }
