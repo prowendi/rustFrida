@@ -112,11 +112,13 @@ pub(super) struct GeneratedMessageChannel {
 }
 
 pub(super) const MANAGED_MESSAGE_CAPACITY: i32 = 4096;
+pub(super) const MANAGED_MESSAGE_MAX_CAPACITY: i32 = 1 << 20;
 pub(super) const MANAGED_MESSAGE_HEAD_FIELD: &str = "__rf_msg_head";
 pub(super) const MANAGED_MESSAGE_TAIL_FIELD: &str = "__rf_msg_tail";
 pub(super) const MANAGED_MESSAGE_DROPPED_FIELD: &str = "__rf_msg_dropped";
 pub(super) const MANAGED_MESSAGE_CODES_FIELD: &str = "__rf_msg_codes";
 pub(super) const MANAGED_MESSAGE_VALUES_FIELD: &str = "__rf_msg_values";
+pub(super) const MANAGED_MESSAGE_TEXTS_FIELD: &str = "__rf_msg_texts";
 
 mod descriptor;
 use descriptor::{
@@ -190,16 +192,42 @@ fn generated_int_array_field(generated_type: &str, name: &str) -> FieldRef {
     FieldRef::new(generated_type.to_string(), "[I".to_string(), name.to_string())
 }
 
-fn build_message_send_code(generated_type: &str) -> Result<DexCode, String> {
-    let capacity = i16::try_from(MANAGED_MESSAGE_CAPACITY)
-        .map_err(|_| format!("managed message capacity too large: {}", MANAGED_MESSAGE_CAPACITY))?;
-    let mask = i16::try_from(MANAGED_MESSAGE_CAPACITY - 1)
-        .map_err(|_| format!("managed message mask too large: {}", MANAGED_MESSAGE_CAPACITY - 1))?;
+fn generated_string_array_field(generated_type: &str, name: &str) -> FieldRef {
+    FieldRef::new(
+        generated_type.to_string(),
+        "[Ljava/lang/String;".to_string(),
+        name.to_string(),
+    )
+}
+
+fn validate_message_capacity(capacity: i32) -> Result<(), String> {
+    if capacity <= 0 {
+        return Err("managed message capacity must be positive".to_string());
+    }
+    if capacity > MANAGED_MESSAGE_MAX_CAPACITY {
+        return Err(format!(
+            "managed message capacity too large: {} > {}",
+            capacity, MANAGED_MESSAGE_MAX_CAPACITY
+        ));
+    }
+    if (capacity & (capacity - 1)) != 0 {
+        return Err(format!(
+            "managed message capacity must be a power of two for the hot-path ring buffer: {}",
+            capacity
+        ));
+    }
+    Ok(())
+}
+
+fn build_message_send_code(generated_type: &str, capacity: i32) -> Result<DexCode, String> {
+    validate_message_capacity(capacity)?;
+    let mask = capacity - 1;
     let head_field = generated_int_field(generated_type, MANAGED_MESSAGE_HEAD_FIELD);
     let tail_field = generated_int_field(generated_type, MANAGED_MESSAGE_TAIL_FIELD);
     let dropped_field = generated_int_field(generated_type, MANAGED_MESSAGE_DROPPED_FIELD);
     let codes_field = generated_int_array_field(generated_type, MANAGED_MESSAGE_CODES_FIELD);
     let values_field = generated_int_array_field(generated_type, MANAGED_MESSAGE_VALUES_FIELD);
+    let texts_field = generated_string_array_field(generated_type, MANAGED_MESSAGE_TEXTS_FIELD);
 
     // v6/v7 are incoming static method args: channel code and int payload.
     let mut ir = DexIrBuilder::new(8, 2, 0);
@@ -207,7 +235,7 @@ fn build_message_send_code(generated_type: &str) -> Result<DexCode, String> {
     ir.sget(1, head_field.clone(), ValueKind::Narrow);
     ir.sget(2, tail_field, ValueKind::Narrow);
     ir.int_binop(DexIntBinOp::Sub, 3, 1, 2);
-    ir.const16(4, capacity);
+    ir.const32(4, capacity);
     ir.if_cmp(IfCmpOp::Lt, 3, 4, ok);
 
     ir.sget(5, dropped_field.clone(), ValueKind::Narrow);
@@ -216,11 +244,55 @@ fn build_message_send_code(generated_type: &str) -> Result<DexCode, String> {
     ir.return_void();
 
     ir.bind(ok)?;
-    ir.int_binop_lit16(DexIntLit16Op::And, 4, 1, mask);
+    ir.const32(5, mask);
+    ir.int_binop(DexIntBinOp::And, 4, 1, 5);
     ir.sget(0, codes_field, ValueKind::Object);
     ir.aput(6, 0, 4, ValueKind::Narrow);
     ir.sget(0, values_field, ValueKind::Object);
     ir.aput(7, 0, 4, ValueKind::Narrow);
+    ir.sget(0, texts_field, ValueKind::Object);
+    ir.const4(5, 0);
+    ir.aput(5, 0, 4, ValueKind::Object);
+    ir.int_binop_lit8(DexIntLit8Op::Add, 1, 1, 1);
+    ir.sput(1, head_field, ValueKind::Narrow);
+    ir.return_void();
+    ir.finish()
+}
+
+fn build_message_send_string_code(generated_type: &str, capacity: i32) -> Result<DexCode, String> {
+    validate_message_capacity(capacity)?;
+    let mask = capacity - 1;
+    let head_field = generated_int_field(generated_type, MANAGED_MESSAGE_HEAD_FIELD);
+    let tail_field = generated_int_field(generated_type, MANAGED_MESSAGE_TAIL_FIELD);
+    let dropped_field = generated_int_field(generated_type, MANAGED_MESSAGE_DROPPED_FIELD);
+    let codes_field = generated_int_array_field(generated_type, MANAGED_MESSAGE_CODES_FIELD);
+    let values_field = generated_int_array_field(generated_type, MANAGED_MESSAGE_VALUES_FIELD);
+    let texts_field = generated_string_array_field(generated_type, MANAGED_MESSAGE_TEXTS_FIELD);
+
+    // v6/v7 are incoming static method args: channel code and String payload.
+    let mut ir = DexIrBuilder::new(8, 2, 0);
+    let ok = ir.new_label();
+    ir.sget(1, head_field.clone(), ValueKind::Narrow);
+    ir.sget(2, tail_field, ValueKind::Narrow);
+    ir.int_binop(DexIntBinOp::Sub, 3, 1, 2);
+    ir.const32(4, capacity);
+    ir.if_cmp(IfCmpOp::Lt, 3, 4, ok);
+
+    ir.sget(5, dropped_field.clone(), ValueKind::Narrow);
+    ir.int_binop_lit8(DexIntLit8Op::Add, 5, 5, 1);
+    ir.sput(5, dropped_field, ValueKind::Narrow);
+    ir.return_void();
+
+    ir.bind(ok)?;
+    ir.const32(5, mask);
+    ir.int_binop(DexIntBinOp::And, 4, 1, 5);
+    ir.sget(0, codes_field, ValueKind::Object);
+    ir.aput(6, 0, 4, ValueKind::Narrow);
+    ir.sget(0, values_field, ValueKind::Object);
+    ir.const4(5, 0);
+    ir.aput(5, 0, 4, ValueKind::Narrow);
+    ir.sget(0, texts_field, ValueKind::Object);
+    ir.aput(7, 0, 4, ValueKind::Object);
     ir.int_binop_lit8(DexIntLit8Op::Add, 1, 1, 1);
     ir.sput(1, head_field, ValueKind::Narrow);
     ir.return_void();
@@ -469,7 +541,9 @@ pub(super) unsafe fn build_managed_dsl_dex(
     target_sig: &str,
     is_static: bool,
     dsl: &str,
+    message_capacity: i32,
 ) -> Result<GeneratedManagedDex, String> {
+    validate_message_capacity(message_capacity)?;
     let program = parse_managed_dsl(dsl)?;
     let uses_orig = program_uses_orig(&program);
     let target_type = java_class_to_descriptor(target_class_name)?;
@@ -621,12 +695,24 @@ pub(super) unsafe fn build_managed_dsl_dex(
             "[I",
             ACC_PUBLIC | ACC_STATIC | ACC_VOLATILE,
         );
+        class.static_field(
+            MANAGED_MESSAGE_TEXTS_FIELD,
+            "[Ljava/lang/String;",
+            ACC_PUBLIC | ACC_STATIC | ACC_VOLATILE,
+        );
         class.direct_method(
             "__rf_send",
             "V",
             vec!["I".to_string(), "I".to_string()],
             ACC_PUBLIC | ACC_STATIC | ACC_SYNCHRONIZED | ACC_SYNTHETIC,
-            build_message_send_code(&generated_type)?,
+            build_message_send_code(&generated_type, message_capacity)?,
+        );
+        class.direct_method(
+            "__rf_send_str",
+            "V",
+            vec!["I".to_string(), "Ljava/lang/String;".to_string()],
+            ACC_PUBLIC | ACC_STATIC | ACC_SYNCHRONIZED | ACC_SYNTHETIC,
+            build_message_send_string_code(&generated_type, message_capacity)?,
         );
     }
     class.direct_method(
@@ -665,7 +751,7 @@ pub(super) unsafe fn build_managed_dsl_dex(
         string_literals: dsl_ctx.string_literals,
         counters: dsl_ctx.counters,
         message_channels: dsl_ctx.message_channels,
-        message_capacity: MANAGED_MESSAGE_CAPACITY,
+        message_capacity,
     })
 }
 

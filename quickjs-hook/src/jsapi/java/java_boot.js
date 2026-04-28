@@ -713,6 +713,7 @@
         this._m = method;
         this._s = sig || null;
         this._cache = cache || null;
+        this._dslBuff = undefined;
     }
 
     // Convert Java type name to JNI type descriptor (mirrors Rust java_type_to_jni)
@@ -1013,6 +1014,21 @@
         set: function(code) {
             var name = this._m === "$init" ? "<init>" : this._m;
             var cls = this._c;
+            var dslCode = code;
+            var inlineBuff = undefined;
+            if (code !== null && code !== undefined && typeof code === "object") {
+                inlineBuff = code.buff;
+                if (code.code !== undefined) {
+                    dslCode = code.code;
+                } else if (code.dsl !== undefined) {
+                    dslCode = code.dsl;
+                } else if (code.script !== undefined) {
+                    dslCode = code.script;
+                } else {
+                    throw new Error("dslImpl object requires code/dsl/script");
+                }
+            }
+            var buff = inlineBuff !== undefined ? inlineBuff : this._dslBuff;
 
             var sigs;
             if (this._s === null) {
@@ -1048,12 +1064,14 @@
                 var installed = [];
                 try {
                     for (var i = 0; i < sigs.length; i++) {
-                        results.push(Java.managedHookDsl({
+                        var opts = {
                             className: cls,
                             methodName: name,
                             signature: sigs[i],
-                            dsl: code
-                        }));
+                            dsl: String(dslCode)
+                        };
+                        if (buff !== undefined) opts.buff = buff;
+                        results.push(Java.managedHookDsl(opts));
                         installed.push(sigs[i]);
                     }
                 } catch (e) {
@@ -1062,11 +1080,33 @@
                     }
                     throw e;
                 }
-                this._dslCode = code;
+                this._dslCode = String(dslCode);
                 this._dslInfo = results.length === 1 ? results[0] : results;
             }
         }
     });
+
+    Object.defineProperty(MethodWrapper.prototype, "buff", {
+        get: function() {
+            return this._dslBuff;
+        },
+        set: function(value) {
+            this._dslBuff = value;
+        }
+    });
+
+    MethodWrapper.prototype.dsl = function(options) {
+        if (options === null || options === undefined) {
+            return this;
+        }
+        if (typeof options !== "object") {
+            throw new Error("dsl options must be an object");
+        }
+        if (options.buff !== undefined) {
+            this._dslBuff = options.buff;
+        }
+        return this;
+    };
 
     Object.defineProperty(MethodWrapper.prototype, "dslInfo", {
         get: function() { return this._dslInfo || null; }
@@ -1378,6 +1418,22 @@
             enumerable: true,
             configurable: true
         });
+
+        Object.defineProperty(callable, "buff", {
+            get: function() {
+                return wrapper.buff;
+            },
+            set: function(value) {
+                wrapper.buff = value;
+            },
+            enumerable: true,
+            configurable: true
+        });
+
+        callable.dsl = function(options) {
+            wrapper.dsl(options);
+            return callable;
+        };
 
         callable.dslDrain = function(max) {
             return wrapper.dslDrain(max);

@@ -1106,7 +1106,15 @@ impl DslSemanticContext {
                 if name.is_empty() {
                     return Err("send() channel name must not be empty".to_string());
                 }
-                self.validate_value_for_expected(value, "I", false)?;
+                let Some(value_desc) = self.infer_value_descriptor(value)? else {
+                    return Err("send() value cannot be null; use an int or java.lang.String".to_string());
+                };
+                if value_desc != "I" && value_desc != "Ljava/lang/String;" {
+                    return Err(format!(
+                        "send() value must be int or java.lang.String, got {}",
+                        value_desc
+                    ));
+                }
             }
             DslStmt::ReturnOrig { args } => self.validate_orig_args(args)?,
             DslStmt::ReturnValue { value } => {

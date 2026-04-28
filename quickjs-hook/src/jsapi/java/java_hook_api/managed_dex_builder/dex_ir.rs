@@ -106,6 +106,10 @@ impl DexIrBuilder {
         self.instrs.push(IrInstr::Const16 { dst, literal });
     }
 
+    pub(super) fn const32(&mut self, dst: u8, literal: i32) {
+        self.instrs.push(IrInstr::Const32 { dst, literal });
+    }
+
     pub(super) fn const_string(&mut self, dst: u8, value: impl Into<String>) {
         self.instrs.push(IrInstr::ConstString {
             dst,
@@ -419,6 +423,10 @@ enum IrInstr {
     Const16 {
         dst: u8,
         literal: i16,
+    },
+    Const32 {
+        dst: u8,
+        literal: i32,
     },
     ConstString {
         dst: u8,
@@ -742,6 +750,7 @@ impl IrInstr {
         match self {
             IrInstr::Const4 { .. } => 1,
             IrInstr::Const16 { .. } => 2,
+            IrInstr::Const32 { .. } => 3,
             IrInstr::ConstString { .. } => 2,
             IrInstr::MoveFrom16 { .. } => 2,
             IrInstr::MoveException { .. } => 1,
@@ -789,6 +798,12 @@ impl IrInstr {
                 require_byte(dst, "const/16 dst")?;
                 code.raw(0x0013 | ((dst as u16) << 8));
                 code.raw(literal as u16);
+            }
+            IrInstr::Const32 { dst, literal } => {
+                require_byte(dst, "const/32 dst")?;
+                code.raw(0x0014 | ((dst as u16) << 8));
+                code.raw(literal as u32 as u16);
+                code.raw(((literal as u32) >> 16) as u16);
             }
             IrInstr::ConstString { dst, value } => {
                 require_byte(dst, "const-string dst")?;

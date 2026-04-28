@@ -16,7 +16,7 @@ use super::install_support::{create_class_global_ref, update_original_method_fla
 use super::managed_dex_builder::{
     build_managed_dsl_dex, GeneratedCounter, GeneratedMessageChannel, GeneratedStringLiteral, MANAGED_MESSAGE_CAPACITY,
     MANAGED_MESSAGE_CODES_FIELD, MANAGED_MESSAGE_DROPPED_FIELD, MANAGED_MESSAGE_HEAD_FIELD, MANAGED_MESSAGE_TAIL_FIELD,
-    MANAGED_MESSAGE_VALUES_FIELD,
+    MANAGED_MESSAGE_TEXTS_FIELD, MANAGED_MESSAGE_VALUES_FIELD,
 };
 
 struct DynamicManagedHelperRefs {
@@ -236,6 +236,7 @@ unsafe fn initialize_generated_message_queue(
     env: JniEnv,
     helper_cls: *mut std::ffi::c_void,
     channels: &[GeneratedMessageChannel],
+    capacity: i32,
 ) -> Result<(), String> {
     if channels.is_empty() {
         return Ok(());
@@ -248,6 +249,7 @@ unsafe fn initialize_generated_message_queue(
         jni_fn!(env, SetStaticObjectFieldFn, JNI_SET_STATIC_OBJECT_FIELD);
     let set_static_int_field: SetStaticIntFieldFn = jni_fn!(env, SetStaticIntFieldFn, JNI_SET_STATIC_INT_FIELD);
     let new_int_array: NewPrimitiveArrayFn = jni_fn!(env, NewPrimitiveArrayFn, JNI_NEW_INT_ARRAY);
+    let new_object_array: NewObjectArrayFn = jni_fn!(env, NewObjectArrayFn, JNI_NEW_OBJECT_ARRAY);
     let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
 
     let int_sig = CString::new("I").unwrap();
@@ -277,7 +279,7 @@ unsafe fn initialize_generated_message_queue(
         if fid.is_null() || jni_check_exc(env) {
             return Err(format!("generated message array field {} not found", field));
         }
-        let array = new_int_array(env, MANAGED_MESSAGE_CAPACITY);
+        let array = new_int_array(env, capacity);
         if array.is_null() || jni_check_exc(env) {
             return Err(format!("NewIntArray failed for generated message array {}", field));
         }
@@ -291,10 +293,40 @@ unsafe fn initialize_generated_message_queue(
         }
     }
 
+    let string_array_sig = CString::new("[Ljava/lang/String;").unwrap();
+    let string_array_name = CString::new(MANAGED_MESSAGE_TEXTS_FIELD).unwrap();
+    let string_array_fid = get_static_field_id(env, helper_cls, string_array_name.as_ptr(), string_array_sig.as_ptr());
+    if string_array_fid.is_null() || jni_check_exc(env) {
+        return Err(format!(
+            "generated message array field {} not found",
+            MANAGED_MESSAGE_TEXTS_FIELD
+        ));
+    }
+    let string_cls = find_class_safe(env, "java.lang.String");
+    if string_cls.is_null() || jni_check_exc(env) {
+        return Err("java.lang.String class not found for generated message text array".to_string());
+    }
+    let string_array = new_object_array(env, capacity, string_cls, std::ptr::null_mut());
+    delete_local_ref(env, string_cls);
+    if string_array.is_null() || jni_check_exc(env) {
+        return Err(format!(
+            "NewObjectArray failed for generated message array {}",
+            MANAGED_MESSAGE_TEXTS_FIELD
+        ));
+    }
+    set_static_object_field(env, helper_cls, string_array_fid, string_array);
+    delete_local_ref(env, string_array);
+    if jni_check_exc(env) {
+        return Err(format!(
+            "SetStaticObjectField failed for generated message array {}",
+            MANAGED_MESSAGE_TEXTS_FIELD
+        ));
+    }
+
     output_message(&format!(
         "[managedHook] initialized message queue capacity={} channel(s)={}",
-        MANAGED_MESSAGE_CAPACITY,
-        channels.len()
+        capacity,
+        channels.len(),
     ));
     Ok(())
 }
@@ -569,6 +601,7 @@ unsafe fn install_managed_dsl_inner(
     method_name: &str,
     sig: &str,
     dsl: &str,
+    message_capacity: i32,
 ) -> Result<ManagedDslInstallResult, String> {
     let scoped_env = scoped_jni_env()?;
     let env = scoped_env.env();
@@ -582,7 +615,16 @@ unsafe fn install_managed_dsl_inner(
         ));
     }
     let class_id = DYNAMIC_MANAGED_CLASS_ID.fetch_add(1, Ordering::Relaxed);
-    let generated = build_managed_dsl_dex(env, class_id, class_name, method_name, sig, is_static, dsl)?;
+    let generated = build_managed_dsl_dex(
+        env,
+        class_id,
+        class_name,
+        method_name,
+        sig,
+        is_static,
+        dsl,
+        message_capacity,
+    )?;
     let helper_class = generated.class_name.clone();
     let helper_method = generated.method_name.clone();
     let helper_signature = generated.method_sig.clone();
@@ -601,7 +643,7 @@ unsafe fn install_managed_dsl_inner(
     ));
     let helper_cls = load_dynamic_managed_helper_class(env, generated.dex, &generated.class_name)?;
     initialize_generated_string_literals(env, helper_cls, &generated.string_literals)?;
-    initialize_generated_message_queue(env, helper_cls, &generated.message_channels)?;
+    initialize_generated_message_queue(env, helper_cls, &generated.message_channels, generated.message_capacity)?;
     install_managed_method_helper(
         env,
         class_name,
@@ -657,11 +699,41 @@ unsafe fn extract_string_prop(
     ))
 }
 
+unsafe fn extract_optional_i32_prop(
+    ctx: *mut ffi::JSContext,
+    obj: JSValue,
+    names: &[&str],
+    api: &str,
+) -> Result<Option<i32>, ffi::JSValue> {
+    for name in names {
+        let value = obj.get_property(ctx, name);
+        if !value.is_undefined() && !value.is_null() {
+            let Some(parsed) = value.to_i64(ctx) else {
+                value.free(ctx);
+                return Err(throw_internal_error(
+                    ctx,
+                    format!("{} option '{}' must be an integer", api, name),
+                ));
+            };
+            value.free(ctx);
+            if parsed < i32::MIN as i64 || parsed > i32::MAX as i64 {
+                return Err(throw_internal_error(
+                    ctx,
+                    format!("{} option '{}' is out of i32 range: {}", api, name, parsed),
+                ));
+            }
+            return Ok(Some(parsed as i32));
+        }
+        value.free(ctx);
+    }
+    Ok(None)
+}
+
 unsafe fn extract_managed_hook_dsl_args(
     ctx: *mut ffi::JSContext,
     argc: i32,
     argv: *mut ffi::JSValue,
-) -> Result<(String, String, String, String), ffi::JSValue> {
+) -> Result<(String, String, String, String, i32), ffi::JSValue> {
     if argc == 1 {
         let opts = JSValue(*argv);
         if !opts.is_object() || ffi::JS_IsArray(ctx, opts.raw()) != 0 {
@@ -674,7 +746,9 @@ unsafe fn extract_managed_hook_dsl_args(
         let method_name = extract_string_prop(ctx, opts, &["methodName", "method"], "managedHookDsl")?;
         let sig = extract_string_prop(ctx, opts, &["signature", "sig"], "managedHookDsl")?;
         let dsl = extract_string_prop(ctx, opts, &["dsl", "script"], "managedHookDsl")?;
-        return Ok((class_name, method_name, sig, dsl));
+        let message_capacity =
+            extract_optional_i32_prop(ctx, opts, &["buff"], "managedHookDsl")?.unwrap_or(MANAGED_MESSAGE_CAPACITY);
+        return Ok((class_name, method_name, sig, dsl, message_capacity));
     }
 
     if argc >= 4 {
@@ -699,7 +773,21 @@ unsafe fn extract_managed_hook_dsl_args(
         let Some(dsl) = JSValue(*argv.add(3)).to_string(ctx) else {
             return Err(throw_internal_error(ctx, "managedHookDsl arg4 dsl must be a string"));
         };
-        return Ok((class_name, method_name, sig, dsl));
+        let message_capacity = if argc >= 5 {
+            match JSValue(*argv.add(4)).to_i64(ctx) {
+                Some(value) => value,
+                None => return Err(throw_internal_error(ctx, "managedHookDsl arg5 buff must be an integer")),
+            }
+        } else {
+            MANAGED_MESSAGE_CAPACITY as i64
+        };
+        if message_capacity < i32::MIN as i64 || message_capacity > i32::MAX as i64 {
+            return Err(throw_internal_error(
+                ctx,
+                format!("managedHookDsl arg5 buff is out of i32 range: {}", message_capacity),
+            ));
+        }
+        return Ok((class_name, method_name, sig, dsl, message_capacity as i32));
     }
 
     Err(throw_internal_error(
@@ -714,12 +802,12 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_managed_hook_dsl(
     argc: i32,
     argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
-    let (class_name, method_name, sig, dsl) = match extract_managed_hook_dsl_args(ctx, argc, argv) {
+    let (class_name, method_name, sig, dsl, message_capacity) = match extract_managed_hook_dsl_args(ctx, argc, argv) {
         Ok(v) => v,
         Err(e) => return e,
     };
 
-    let result = match install_managed_dsl_inner(&class_name, &method_name, &sig, &dsl) {
+    let result = match install_managed_dsl_inner(&class_name, &method_name, &sig, &dsl, message_capacity) {
         Ok(result) => result,
         Err(msg) => return throw_internal_error(ctx, msg),
     };
@@ -740,7 +828,7 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_managed_hook_dsl(
         messages.set_property(ctx, &channel.name, JSValue::int(channel.code));
     }
     obj.set_property(ctx, "messages", messages);
-    obj.set_property(ctx, "messageCapacity", JSValue::int(result.message_capacity));
+    obj.set_property(ctx, "buff", JSValue::int(result.message_capacity));
     obj.raw()
 }
 
@@ -786,13 +874,13 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_managed_drain_messages(
         Ok(value) => value,
         Err(err) => return err,
     };
-    let max_items = if argc >= 2 {
-        JSValue(*argv.add(1))
-            .to_i64(ctx)
-            .map(|value| value.clamp(0, MANAGED_MESSAGE_CAPACITY as i64) as i32)
-            .unwrap_or(MANAGED_MESSAGE_CAPACITY)
+    let max_items_requested = if argc >= 2 {
+        match JSValue(*argv.add(1)).to_i64(ctx) {
+            Some(value) => Some(value),
+            None => return throw_internal_error(ctx, "managedDrainMessages max must be an integer"),
+        }
     } else {
-        MANAGED_MESSAGE_CAPACITY
+        None
     };
     let Some(helper_cls) = find_dynamic_managed_helper_class(&helper_class) else {
         return throw_internal_error(ctx, format!("managed helper class not found: {}", helper_class));
@@ -806,7 +894,10 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_managed_drain_messages(
     let set_static_int_field: SetStaticIntFieldFn = jni_fn!(env, SetStaticIntFieldFn, JNI_SET_STATIC_INT_FIELD);
     let get_static_object_field: GetStaticObjectFieldFn =
         jni_fn!(env, GetStaticObjectFieldFn, JNI_GET_STATIC_OBJECT_FIELD);
+    let get_array_length: GetArrayLengthFn = jni_fn!(env, GetArrayLengthFn, JNI_GET_ARRAY_LENGTH);
     let get_int_array_region: GetIntArrayRegionFn = jni_fn!(env, GetIntArrayRegionFn, JNI_GET_INT_ARRAY_REGION);
+    let get_object_array_element: GetObjectArrayElementFn =
+        jni_fn!(env, GetObjectArrayElementFn, JNI_GET_OBJECT_ARRAY_ELEMENT);
     let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
 
     let head_fid = match managed_static_field_id(env, helper_cls, MANAGED_MESSAGE_HEAD_FIELD, "I") {
@@ -829,6 +920,10 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_managed_drain_messages(
         Ok(fid) => fid,
         Err(msg) => return throw_internal_error(ctx, msg),
     };
+    let texts_fid = match managed_static_field_id(env, helper_cls, MANAGED_MESSAGE_TEXTS_FIELD, "[Ljava/lang/String;") {
+        Ok(fid) => fid,
+        Err(msg) => return throw_internal_error(ctx, msg),
+    };
 
     let head = get_static_int_field(env, helper_cls, head_fid);
     let tail = get_static_int_field(env, helper_cls, tail_fid);
@@ -836,34 +931,64 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_managed_drain_messages(
     if jni_check_exc(env) {
         return throw_internal_error(ctx, "managedDrainMessages failed to read queue counters");
     }
-    let available = (head as i64 - tail as i64).clamp(0, MANAGED_MESSAGE_CAPACITY as i64) as i32;
+    let codes_array = get_static_object_field(env, helper_cls, codes_fid);
+    let values_array = get_static_object_field(env, helper_cls, values_fid);
+    let texts_array = get_static_object_field(env, helper_cls, texts_fid);
+    if codes_array.is_null() || values_array.is_null() || texts_array.is_null() || jni_check_exc(env) {
+        return throw_internal_error(ctx, "managedDrainMessages message arrays are not initialized");
+    }
+    let capacity = get_array_length(env, codes_array)
+        .min(get_array_length(env, values_array))
+        .min(get_array_length(env, texts_array));
+    if capacity <= 0 || jni_check_exc(env) {
+        delete_local_ref(env, codes_array);
+        delete_local_ref(env, values_array);
+        delete_local_ref(env, texts_array);
+        return throw_internal_error(ctx, "managedDrainMessages message arrays have invalid capacity");
+    }
+    let available = (head as i64 - tail as i64).clamp(0, capacity as i64) as i32;
+    let max_items = max_items_requested
+        .map(|value| value.clamp(0, capacity as i64) as i32)
+        .unwrap_or(capacity);
     let count = available.min(max_items);
 
     let arr = ffi::JS_NewArray(ctx);
     if count > 0 {
-        let codes_array = get_static_object_field(env, helper_cls, codes_fid);
-        let values_array = get_static_object_field(env, helper_cls, values_fid);
-        if codes_array.is_null() || values_array.is_null() || jni_check_exc(env) {
-            return throw_internal_error(ctx, "managedDrainMessages message arrays are not initialized");
-        }
-        let mut codes = vec![0i32; MANAGED_MESSAGE_CAPACITY as usize];
-        let mut values = vec![0i32; MANAGED_MESSAGE_CAPACITY as usize];
-        get_int_array_region(env, codes_array, 0, MANAGED_MESSAGE_CAPACITY, codes.as_mut_ptr());
-        get_int_array_region(env, values_array, 0, MANAGED_MESSAGE_CAPACITY, values.as_mut_ptr());
-        delete_local_ref(env, codes_array);
-        delete_local_ref(env, values_array);
+        let mut codes = vec![0i32; capacity as usize];
+        let mut values = vec![0i32; capacity as usize];
+        get_int_array_region(env, codes_array, 0, capacity, codes.as_mut_ptr());
+        get_int_array_region(env, values_array, 0, capacity, values.as_mut_ptr());
         if jni_check_exc(env) {
+            delete_local_ref(env, codes_array);
+            delete_local_ref(env, values_array);
+            delete_local_ref(env, texts_array);
             return throw_internal_error(ctx, "managedDrainMessages failed to read message arrays");
         }
-        let mask = MANAGED_MESSAGE_CAPACITY - 1;
+        let mask = capacity - 1;
         for i in 0..count {
             let slot = ((tail + i) & mask) as usize;
             let item = JSValue(ffi::JS_NewObject(ctx));
             item.set_property(ctx, "code", JSValue::int(codes[slot]));
-            item.set_property(ctx, "value", JSValue::int(values[slot]));
+            let text_obj = get_object_array_element(env, texts_array, slot as i32);
+            if !text_obj.is_null() && !jni_check_exc(env) {
+                if let Some(text) = unsafe { super::super::try_read_jstring(env as u64, text_obj as u64) } {
+                    let value = JSValue::string(ctx, &text);
+                    item.set_property(ctx, "value", value);
+                    item.set_property(ctx, "text", JSValue::string(ctx, &text));
+                } else {
+                    item.set_property(ctx, "value", JSValue::int(values[slot]));
+                }
+                delete_local_ref(env, text_obj);
+            } else {
+                jni_check_exc(env);
+                item.set_property(ctx, "value", JSValue::int(values[slot]));
+            }
             ffi::JS_SetPropertyUint32(ctx, arr, i as u32, item.raw());
         }
     }
+    delete_local_ref(env, codes_array);
+    delete_local_ref(env, values_array);
+    delete_local_ref(env, texts_array);
     let new_tail = tail.wrapping_add(count);
     set_static_int_field(env, helper_cls, tail_fid, new_tail);
     if jni_check_exc(env) {
@@ -874,6 +999,7 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_managed_drain_messages(
     out.set_property(ctx, "head", JSValue::int(head));
     out.set_property(ctx, "tail", JSValue::int(new_tail));
     out.set_property(ctx, "dropped", JSValue::int(dropped));
+    out.set_property(ctx, "capacity", JSValue::int(capacity));
     out.raw()
 }
 

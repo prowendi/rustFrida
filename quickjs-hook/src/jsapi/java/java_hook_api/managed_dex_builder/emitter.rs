@@ -267,6 +267,15 @@ impl DslBuildContext {
         )
     }
 
+    fn message_send_string_method(&self) -> MethodRef {
+        MethodRef::new(
+            self.generated_type.clone(),
+            "__rf_send_str".to_string(),
+            "V".to_string(),
+            vec!["I".to_string(), "Ljava/lang/String;".to_string()],
+        )
+    }
+
     fn with_target_narrow_type<F>(&mut self, key: DslTargetKey, descriptor: String, f: F) -> Result<bool, String>
     where
         F: FnOnce(&mut Self) -> Result<bool, String>,
@@ -4275,9 +4284,16 @@ fn emit_send(
         return Err(format!("too many DSL message channels: {}", code));
     }
     ir.const16(REG_TMP0, code as i16);
-    let value_reg = emit_load_value(ir, value, "I", REG_TMP1, layout, dsl_ctx)?;
-    let value_reg = emit_copy_field_value_if_needed(ir, value_reg, REG_TMP1, ValueKind::Narrow);
-    ir.invoke_static(vec![REG_TMP0, value_reg], dsl_ctx.message_send_method());
+    let value_desc = infer_value_descriptor(value, layout, dsl_ctx)?;
+    if value_desc.as_deref() == Some("Ljava/lang/String;") {
+        let value_reg = emit_load_value(ir, value, "Ljava/lang/String;", REG_TMP1, layout, dsl_ctx)?;
+        let value_reg = emit_copy_field_value_if_needed(ir, value_reg, REG_TMP1, ValueKind::Object);
+        ir.invoke_static(vec![REG_TMP0, value_reg], dsl_ctx.message_send_string_method());
+    } else {
+        let value_reg = emit_load_value(ir, value, "I", REG_TMP1, layout, dsl_ctx)?;
+        let value_reg = emit_copy_field_value_if_needed(ir, value_reg, REG_TMP1, ValueKind::Narrow);
+        ir.invoke_static(vec![REG_TMP0, value_reg], dsl_ctx.message_send_method());
+    }
     Ok(())
 }
 
