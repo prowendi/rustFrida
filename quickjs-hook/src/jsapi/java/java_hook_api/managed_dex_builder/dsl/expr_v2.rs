@@ -102,6 +102,8 @@ fn parse_v2_postfix_expr(
                 index: Box::new(index),
                 type_name,
             };
+        } else if stream.peek_op("?.") || stream.peek_char('.') {
+            value = parse_v2_member_postfix(stream, local_scopes, value)?;
         } else {
             return Ok(value);
         }
@@ -215,6 +217,122 @@ fn parse_v2_value_arg_list_until_close(
         if !stream.consume_char(',') {
             return Ok(args);
         }
+    }
+}
+
+fn parse_v2_member_postfix(
+    stream: &mut DslTokenStream<'_>,
+    local_scopes: &[BTreeMap<String, String>],
+    receiver: DslValue,
+) -> Result<DslValue, String> {
+    let null_safe = if stream.consume_op("?.") {
+        true
+    } else if stream.consume_char('.') {
+        false
+    } else {
+        return Err(stream.err("expected member access"));
+    };
+    let member_name = stream.parse_ident()?;
+    if member_name == "length" && !stream.peek_char('(') && !stream.peek_char('.') {
+        return Ok(DslValue::ArrayLength(Box::new(receiver)));
+    }
+    if member_name == "$new" {
+        return Err(stream.err("$new is only supported on class names"));
+    }
+
+    let mut call_kind = DslCallKind::Virtual;
+    if stream.peek_char('.') {
+        if !stream.consume_char('.') || !stream.consume_ident("interface") {
+            return Err(stream.err("unsupported chained member access in expression v2"));
+        }
+        call_kind = DslCallKind::Interface;
+    }
+    if stream.peek_char('.') {
+        return Err(stream.err("overload member access is handled by the legacy parser"));
+    }
+    if !stream.peek_char('(') {
+        return build_v2_receiver_field(stream, receiver, member_name, call_kind);
+    }
+    stream.consume_char('(');
+    let args = parse_v2_direct_call_args(stream, local_scopes)?;
+    if !stream.consume_char(')') {
+        return Err(stream.err("expected ')'"));
+    }
+    Ok(build_v2_receiver_call(
+        receiver,
+        null_safe,
+        member_name,
+        call_kind,
+        args,
+    ))
+}
+
+fn parse_v2_direct_call_args(
+    stream: &mut DslTokenStream<'_>,
+    local_scopes: &[BTreeMap<String, String>],
+) -> Result<Vec<DslValue>, String> {
+    let mut args = Vec::new();
+    loop {
+        if stream.peek_char(')') {
+            return Ok(args);
+        }
+        if matches!(stream.current_kind(), Some(DslTokenKind::String(_))) {
+            return Err(stream.err("string-leading call arguments are handled by the legacy parser"));
+        }
+        args.push(parse_v2_int_binary_expr(stream, local_scopes, 0)?);
+        if !stream.consume_char(',') {
+            return Ok(args);
+        }
+    }
+}
+
+fn build_v2_receiver_call(
+    receiver: DslValue,
+    null_safe: bool,
+    method_name: String,
+    kind: DslCallKind,
+    args: Vec<DslValue>,
+) -> DslValue {
+    let (target, receiver) = split_simple_target_receiver(receiver);
+    DslValue::Call(DslCallStmt {
+        kind,
+        target,
+        receiver: receiver.map(Box::new),
+        null_safe,
+        class_name: None,
+        method_name,
+        sig: String::new(),
+        args,
+    })
+}
+
+fn build_v2_receiver_field(
+    stream: &DslTokenStream<'_>,
+    receiver: DslValue,
+    field_name: String,
+    kind: DslCallKind,
+) -> Result<DslValue, String> {
+    if kind == DslCallKind::Interface {
+        return Err(stream.err("interface field access is not supported"));
+    }
+    let (target, receiver) = split_simple_target_receiver(receiver);
+    Ok(DslValue::FieldGet {
+        stmt: Box::new(DslFieldStmt {
+            target,
+            receiver: receiver.map(Box::new),
+            class_name: None,
+            field_name,
+            type_name: String::new(),
+            value: None,
+        }),
+        is_static: false,
+    })
+}
+
+fn split_simple_target_receiver(value: DslValue) -> (Option<DslTarget>, Option<DslValue>) {
+    match value {
+        DslValue::Target(target) => (Some(target), None),
+        value => (None, Some(value)),
     }
 }
 
