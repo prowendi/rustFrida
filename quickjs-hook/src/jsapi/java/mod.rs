@@ -37,10 +37,10 @@ pub(crate) mod callback;
 mod heap_scan;
 mod java_array_api;
 mod java_choose_api;
+pub(crate) mod java_fast_api;
 mod java_field_api;
 pub(crate) mod java_hook_api;
 mod java_inspect_api;
-pub(crate) mod java_lua_fast_api;
 mod java_method_list_api;
 pub(crate) mod jni_core;
 pub(crate) mod reflect;
@@ -72,10 +72,10 @@ use art_controller::{set_stealth_mode, stealth_mode};
 use art_method::{resolve_art_method, try_invalidate_jit_cache};
 use callback::*;
 use java_choose_api::*;
+use java_fast_api::*;
 use java_field_api::*;
 use java_hook_api::*;
 use java_inspect_api::*;
-use java_lua_fast_api::*;
 use java_method_list_api::*;
 use jni_core::*;
 use reflect::*;
@@ -683,156 +683,6 @@ unsafe extern "C" fn js_reset_art_route_stats(
     JSValue::bool(true).raw()
 }
 
-unsafe extern "C" fn js_lua_callback_stats(
-    ctx: *mut ffi::JSContext,
-    _this: ffi::JSValue,
-    _argc: i32,
-    _argv: *mut ffi::JSValue,
-) -> ffi::JSValue {
-    let (total, active, max_active, thread_states, orig_requests, native_enter, native_leave, native_fail) =
-        crate::lua::callback_stats();
-    let obj = ffi::JS_NewObject(ctx);
-    let obj_val = JSValue(obj);
-    let (quick_active, quick_oldest_age, quick_drop_begin, quick_drop_end, quick_diag) =
-        crate::lua::callback::quick_diag_snapshot();
-    let (
-        quick_callback_total_ns,
-        quick_callback_max_ns,
-        quick_main_callback_total,
-        quick_main_callback_total_ns,
-        quick_main_callback_max_ns,
-        trans_start_before_runnable,
-        trans_start_after_native,
-        trans_start_after_other,
-        trans_end_before_native,
-        trans_end_after_runnable,
-        trans_end_after_other,
-        trans_start_flags,
-        trans_end_flags,
-        trans_last_start_before,
-        trans_last_start_after,
-        trans_last_end_before,
-        trans_last_end_after,
-    ) = crate::lua::callback::quick_timing_snapshot();
-    obj_val.set_property(ctx, "total", JSValue(ffi::JS_NewBigUint64(ctx, total)));
-    obj_val.set_property(ctx, "active", JSValue(ffi::JS_NewBigUint64(ctx, active)));
-    obj_val.set_property(ctx, "maxActive", JSValue(ffi::JS_NewBigUint64(ctx, max_active)));
-    obj_val.set_property(ctx, "threadStates", JSValue(ffi::JS_NewBigUint64(ctx, thread_states)));
-    obj_val.set_property(ctx, "origRequests", JSValue(ffi::JS_NewBigUint64(ctx, orig_requests)));
-    obj_val.set_property(ctx, "nativeEnter", JSValue(ffi::JS_NewBigUint64(ctx, native_enter)));
-    obj_val.set_property(ctx, "nativeLeave", JSValue(ffi::JS_NewBigUint64(ctx, native_leave)));
-    obj_val.set_property(ctx, "nativeFail", JSValue(ffi::JS_NewBigUint64(ctx, native_fail)));
-    obj_val.set_property(ctx, "quickActive", JSValue(ffi::JS_NewBigUint64(ctx, quick_active)));
-    obj_val.set_property(
-        ctx,
-        "quickOldestAgeMs",
-        JSValue(ffi::JS_NewBigUint64(ctx, quick_oldest_age)),
-    );
-    obj_val.set_property(
-        ctx,
-        "quickDropBegin",
-        JSValue(ffi::JS_NewBigUint64(ctx, quick_drop_begin)),
-    );
-    obj_val.set_property(ctx, "quickDropEnd", JSValue(ffi::JS_NewBigUint64(ctx, quick_drop_end)));
-    obj_val.set_property(
-        ctx,
-        "quickCallbackTotalNs",
-        JSValue(ffi::JS_NewBigUint64(ctx, quick_callback_total_ns)),
-    );
-    obj_val.set_property(
-        ctx,
-        "quickCallbackMaxNs",
-        JSValue(ffi::JS_NewBigUint64(ctx, quick_callback_max_ns)),
-    );
-    obj_val.set_property(
-        ctx,
-        "quickMainCallbacks",
-        JSValue(ffi::JS_NewBigUint64(ctx, quick_main_callback_total)),
-    );
-    obj_val.set_property(
-        ctx,
-        "quickMainCallbackTotalNs",
-        JSValue(ffi::JS_NewBigUint64(ctx, quick_main_callback_total_ns)),
-    );
-    obj_val.set_property(
-        ctx,
-        "quickMainCallbackMaxNs",
-        JSValue(ffi::JS_NewBigUint64(ctx, quick_main_callback_max_ns)),
-    );
-    obj_val.set_property(
-        ctx,
-        "transitionStartBeforeRunnable",
-        JSValue(ffi::JS_NewBigUint64(ctx, trans_start_before_runnable)),
-    );
-    obj_val.set_property(
-        ctx,
-        "transitionStartAfterNative",
-        JSValue(ffi::JS_NewBigUint64(ctx, trans_start_after_native)),
-    );
-    obj_val.set_property(
-        ctx,
-        "transitionStartAfterOther",
-        JSValue(ffi::JS_NewBigUint64(ctx, trans_start_after_other)),
-    );
-    obj_val.set_property(
-        ctx,
-        "transitionEndBeforeNative",
-        JSValue(ffi::JS_NewBigUint64(ctx, trans_end_before_native)),
-    );
-    obj_val.set_property(
-        ctx,
-        "transitionEndAfterRunnable",
-        JSValue(ffi::JS_NewBigUint64(ctx, trans_end_after_runnable)),
-    );
-    obj_val.set_property(
-        ctx,
-        "transitionEndAfterOther",
-        JSValue(ffi::JS_NewBigUint64(ctx, trans_end_after_other)),
-    );
-    obj_val.set_property(
-        ctx,
-        "transitionStartFlags",
-        JSValue(ffi::JS_NewBigUint64(ctx, trans_start_flags)),
-    );
-    obj_val.set_property(
-        ctx,
-        "transitionEndFlags",
-        JSValue(ffi::JS_NewBigUint64(ctx, trans_end_flags)),
-    );
-    obj_val.set_property(
-        ctx,
-        "transitionLastStartBefore",
-        JSValue(ffi::JS_NewBigUint64(ctx, trans_last_start_before)),
-    );
-    obj_val.set_property(
-        ctx,
-        "transitionLastStartAfter",
-        JSValue(ffi::JS_NewBigUint64(ctx, trans_last_start_after)),
-    );
-    obj_val.set_property(
-        ctx,
-        "transitionLastEndBefore",
-        JSValue(ffi::JS_NewBigUint64(ctx, trans_last_end_before)),
-    );
-    obj_val.set_property(
-        ctx,
-        "transitionLastEndAfter",
-        JSValue(ffi::JS_NewBigUint64(ctx, trans_last_end_after)),
-    );
-    obj_val.set_property(ctx, "quickDiag", JSValue::string(ctx, &quick_diag));
-    obj
-}
-
-unsafe extern "C" fn js_reset_lua_callback_stats(
-    _ctx: *mut ffi::JSContext,
-    _this: ffi::JSValue,
-    _argc: i32,
-    _argv: *mut ffi::JSValue,
-) -> ffi::JSValue {
-    crate::lua::reset_callback_stats();
-    JSValue::bool(true).raw()
-}
-
 /// JS CFunction: Java.setStealth(mode) — 设置 stealth 模式
 ///
 /// mode: Hook.NORMAL (0) / false, Hook.WXSHADOW (1) / true, Hook.RECOMP (2)
@@ -1149,7 +999,6 @@ pub fn register_java_api(ctx: &JSContext) {
         let ctx_ptr = ctx.as_ptr();
         add_cfunction_to_object(ctx_ptr, java_obj, "hook", js_java_hook, 4);
         add_cfunction_to_object(ctx_ptr, java_obj, "hookQuick", js_java_hook_quick, 4);
-        add_cfunction_to_object(ctx_ptr, java_obj, "luaHook", js_lua_hook, 4);
         add_cfunction_to_object(ctx_ptr, java_obj, "fastHook", js_fast_hook, 4);
         add_cfunction_to_object(ctx_ptr, java_obj, "managedHookDsl", js_managed_hook_dsl, 4);
         add_cfunction_to_object(ctx_ptr, java_obj, "managedReadCounter", js_managed_read_counter, 2);
@@ -1178,15 +1027,7 @@ pub fn register_java_api(ctx: &JSContext) {
         add_cfunction_to_object(ctx_ptr, java_obj, "_artRouterDebug", js_art_router_debug, 0);
         add_cfunction_to_object(ctx_ptr, java_obj, "_artRouteStats", js_art_route_stats, 0);
         add_cfunction_to_object(ctx_ptr, java_obj, "_resetArtRouteStats", js_reset_art_route_stats, 0);
-        add_cfunction_to_object(ctx_ptr, java_obj, "_luaCallbackStats", js_lua_callback_stats, 0);
         add_cfunction_to_object(ctx_ptr, java_obj, "_fastHookStats", js_fast_hook_stats, 0);
-        add_cfunction_to_object(
-            ctx_ptr,
-            java_obj,
-            "_resetLuaCallbackStats",
-            js_reset_lua_callback_stats,
-            0,
-        );
         add_cfunction_to_object(ctx_ptr, java_obj, "_methods", js_java_methods, 1);
         // Instance method invocation helper used by Java object proxies
         add_cfunction_to_object(ctx_ptr, java_obj, "_invokeMethod", js_java_invoke_method, 4);
@@ -1218,10 +1059,9 @@ pub fn register_java_api(ctx: &JSContext) {
         add_cfunction_to_object(ctx_ptr, java_obj, "_inspectArtMethod", js_java_inspect_art_method, 3);
         add_cfunction_to_object(ctx_ptr, java_obj, "_jitInfo", js_java_jit_info, 0);
         add_cfunction_to_object(ctx_ptr, java_obj, "compileMethod", js_java_compile_method, 4);
-        add_cfunction_to_object(ctx_ptr, java_obj, "luaFastMethod", js_java_lua_fast_method, 3);
-        add_cfunction_to_object(ctx_ptr, java_obj, "luaFastConstructor", js_java_lua_fast_constructor, 3);
-        add_cfunction_to_object(ctx_ptr, java_obj, "luaFastField", js_java_lua_fast_field, 3);
-        add_cfunction_to_object(ctx_ptr, java_obj, "fastField", js_java_lua_fast_field, 3);
+        add_cfunction_to_object(ctx_ptr, java_obj, "fastMethod", js_java_fast_method, 3);
+        add_cfunction_to_object(ctx_ptr, java_obj, "fastConstructor", js_java_fast_constructor, 3);
+        add_cfunction_to_object(ctx_ptr, java_obj, "fastField", js_java_fast_field, 3);
         add_cfunction_to_object(
             ctx_ptr,
             java_obj,

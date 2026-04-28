@@ -377,7 +377,7 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_fast_hook_stats(
     _argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
     let stats = crate::fast_hook::fast_stats();
-    let (art_exception_seen, art_exception_cleared) = crate::jsapi::java::java_lua_fast_api::fast_art_exception_stats();
+    let (art_exception_seen, art_exception_cleared) = crate::jsapi::java::java_fast_api::fast_art_exception_stats();
     let (
         handle_scope_enter,
         handle_scope_unavailable,
@@ -385,7 +385,7 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_fast_hook_stats(
         handle_scope_max_roots,
         handle_scope_root_failed,
         handle_scope_capacity_exceeded,
-    ) = crate::jsapi::java::java_lua_fast_api::fast_art_handle_scope_stats();
+    ) = crate::jsapi::java::java_fast_api::fast_art_handle_scope_stats();
     let obj = ffi::JS_NewObject(ctx);
     let obj_val = JSValue(obj);
     obj_val.set_property(ctx, "total", JSValue(ffi::JS_NewBigUint64(ctx, stats.total)));

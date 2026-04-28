@@ -880,7 +880,7 @@ pub(super) static GET_OAT_HOOK_POOL_LAST_PC: AtomicU64 = AtomicU64::new(0);
 /// DoCall on_enter: 检查 x0 (ArtMethod*) 是否在 replacedMethods 中，有则替换。
 /// 包含递归防护: 如果当前栈帧来自 callOriginal (managedStack 中已有 replacement)，
 /// 则跳过替换，让 original method 正常执行，防止无限递归。
-unsafe extern "C" fn on_do_call_enter(ctx_ptr: *mut hook_ffi::HookContext, user_data: *mut std::ffi::c_void) {
+unsafe extern "C" fn on_do_call_enter(ctx_ptr: *mut hook_ffi::HookContext, _user_data: *mut std::ffi::c_void) {
     if ctx_ptr.is_null() {
         return;
     }
@@ -891,13 +891,6 @@ unsafe extern "C" fn on_do_call_enter(ctx_ptr: *mut hook_ffi::HookContext, user_
 
     // 默认: miss → tail-jump (原函数跑完不回 thunk, 无栈帧残留)
     ctx.intercept_leave = 0;
-
-    if route_mode == 1 && crate::lua::is_lua_hook(method) {
-        let is_range = (user_data as usize) != 0;
-        crate::lua::callback::lua_hook_dispatch_from_do_call(ctx_ptr, is_range);
-        DO_CALL_QUICK_CALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
-        return;
-    }
 
     if let Some(replacement) = get_replacement_method(method) {
         DO_CALL_HIT_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -1088,29 +1081,7 @@ pub unsafe extern "C" fn art_router_stack_check(replacement: u64) -> i32 {
         return if should_replace_for_stack(replacement) { 1 } else { 0 };
     }
 
-    // Lua hook 快速路径: 无 JS engine 锁, 无 cooldown gate, 每次都执行
-    let original_for_lua = original_for_quick;
-    if original_for_lua != 0 && crate::lua::is_lua_hook(original_for_lua) {
-        if !should_sample_original_method(original_for_lua) {
-            return 0;
-        }
-        // Lua hook: 只检查 bypass 栈和 managed stack
-        let stack = get_bypass_stack();
-        if !stack.is_empty() {
-            for &bypassed in stack.iter() {
-                if bypassed == original_for_lua {
-                    return 0;
-                }
-            }
-        }
-        return if should_replace_for_stack(replacement) { 1 } else { 0 };
-    }
-
-    let original_for_js = if original_for_lua != 0 {
-        original_for_lua
-    } else {
-        hook_ffi::hook_art_router_table_lookup_original(replacement)
-    };
+    let original_for_js = hook_ffi::hook_art_router_table_lookup_original(replacement);
     if !should_sample_original_method(original_for_js) {
         return 0;
     }
@@ -1145,11 +1116,7 @@ pub unsafe extern "C" fn art_router_stack_check(replacement: u64) -> i32 {
     // TLS bypass 栈: 检查栈中是否有任何一个 entry 匹配当前 replacement 的 original
     let stack = get_bypass_stack();
     if !stack.is_empty() {
-        let original = if original_for_lua != 0 {
-            original_for_lua
-        } else {
-            hook_ffi::hook_art_router_table_lookup_original(replacement)
-        };
+        let original = hook_ffi::hook_art_router_table_lookup_original(replacement);
         if original != 0 {
             for &bypassed in stack.iter() {
                 if bypassed == original {

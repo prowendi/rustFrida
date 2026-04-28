@@ -1,5 +1,5 @@
 use crate::ffi::hook as hook_ffi;
-use crate::jsapi::java::java_lua_fast_api::{LuaFastConstructor, LuaFastMethod};
+use crate::jsapi::java::java_fast_api::{FastConstructor, FastMethod};
 use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use std::sync::Mutex;
 
@@ -19,13 +19,13 @@ enum ValueRef {
         object: Box<ValueRef>,
     },
     Call {
-        method: Box<LuaFastMethod>,
+        method: Box<FastMethod>,
         receiver: Box<ValueRef>,
         args: Vec<ValueRef>,
         exact_receiver: bool,
     },
     New {
-        ctor: Box<LuaFastConstructor>,
+        ctor: Box<FastConstructor>,
         args: Vec<ValueRef>,
     },
 }
@@ -696,11 +696,11 @@ fn parse_call_ref(inner: &str, exact_receiver: bool) -> Result<ValueRef, String>
     }
     let handle = parse_u64_literal(args[0]).ok_or_else(|| {
         format!(
-            "method handle must be a numeric literal created by Java.luaFastMethod(): {}",
+            "method handle must be a numeric literal created by Java.fastMethod(): {}",
             args[0]
         )
     })?;
-    let Some(method) = crate::jsapi::java::java_lua_fast_api::get_lua_fast_method(handle) else {
+    let Some(method) = crate::jsapi::java::java_fast_api::get_fast_method(handle) else {
         return Err(format!("unknown fast method handle: {}", handle));
     };
 
@@ -742,11 +742,11 @@ fn parse_new_ref(inner: &str) -> Result<ValueRef, String> {
     }
     let handle = parse_u64_literal(args[0]).ok_or_else(|| {
         format!(
-            "constructor handle must be a numeric literal created by Java.luaFastConstructor(): {}",
+            "constructor handle must be a numeric literal created by Java.fastConstructor(): {}",
             args[0]
         )
     })?;
-    let Some(ctor) = crate::jsapi::java::java_lua_fast_api::get_lua_fast_constructor(handle) else {
+    let Some(ctor) = crate::jsapi::java::java_fast_api::get_fast_constructor(handle) else {
         return Err(format!("unknown fast constructor handle: {}", handle));
     };
     let expected = ctor.param_types.len();
@@ -810,11 +810,11 @@ fn split_top_level_args(text: &str) -> Result<Vec<&str>, String> {
 fn parse_field_ref(handle_text: &str, object_text: &str) -> Result<ValueRef, String> {
     let handle = parse_u64_literal(handle_text).ok_or_else(|| {
         format!(
-            "field handle must be a numeric literal created by Java.luaFastField()/Java.fastField(): {}",
+            "field handle must be a numeric literal created by Java.fastField(): {}",
             handle_text
         )
     })?;
-    let Some(field) = crate::jsapi::java::java_lua_fast_api::get_lua_fast_field(handle) else {
+    let Some(field) = crate::jsapi::java::java_fast_api::get_fast_field(handle) else {
         return Err(format!("unknown fast field handle: {}", handle));
     };
     if field.is_static {
@@ -903,16 +903,12 @@ unsafe fn read_value(ctx: &hook_ffi::HookContext, rule: &FastRule, value: &Value
             } else {
                 read_value(ctx, rule, receiver)
             };
-            if *exact_receiver
-                && !crate::jsapi::java::java_lua_fast_api::lua_fast_method_receiver_is_exact(method, recv)
-            {
+            if *exact_receiver && !crate::jsapi::java::java_fast_api::fast_method_receiver_is_exact(method, recv) {
                 return 0;
             }
             service_quick_suspend(ctx);
             let ret = with_raw_value_args(ctx, rule, args, |raw_args| {
-                crate::jsapi::java::java_lua_fast_api::invoke_lua_fast_method_raw_on_thread(
-                    method, ctx.x[19], recv, raw_args,
-                )
+                crate::jsapi::java::java_fast_api::invoke_fast_method_raw_on_thread(method, ctx.x[19], recv, raw_args)
             })
             .unwrap_or(0);
             service_quick_suspend(ctx);
@@ -924,14 +920,14 @@ unsafe fn read_value(ctx: &hook_ffi::HookContext, rule: &FastRule, value: &Value
             let thread = ctx.x[19];
             service_quick_suspend(ctx);
             let Some(obj) =
-                crate::jsapi::java::java_lua_fast_api::alloc_lua_fast_object_quick_on_thread(thread, ctor.class_mirror)
+                crate::jsapi::java::java_fast_api::alloc_fast_object_quick_on_thread(thread, ctor.class_mirror)
             else {
                 FAST_NEW_FAILED.fetch_add(1, Ordering::Relaxed);
                 let elapsed = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
                 record_new_latency(elapsed);
                 return 0;
             };
-            let root = match crate::jsapi::java::java_lua_fast_api::root_lua_fast_raw_object_for_callback(obj) {
+            let root = match crate::jsapi::java::java_fast_api::root_fast_raw_object_for_callback(obj) {
                 Ok(root) => root,
                 _ => {
                     FAST_NEW_FAILED.fetch_add(1, Ordering::Relaxed);
@@ -950,11 +946,11 @@ unsafe fn read_value(ctx: &hook_ffi::HookContext, rule: &FastRule, value: &Value
                     return 0;
                 }
             };
-            let obj = crate::jsapi::java::java_lua_fast_api::read_lua_fast_art_root(root).unwrap_or(obj);
-            let ret = match crate::jsapi::java::java_lua_fast_api::invoke_lua_fast_constructor_raw_on_thread(
+            let obj = crate::jsapi::java::java_fast_api::read_fast_art_root(root).unwrap_or(obj);
+            let ret = match crate::jsapi::java::java_fast_api::invoke_fast_constructor_raw_on_thread(
                 ctor, thread, obj, &ctor_args,
             ) {
-                Ok(()) => crate::jsapi::java::java_lua_fast_api::read_lua_fast_art_root(root).unwrap_or(obj),
+                Ok(()) => crate::jsapi::java::java_fast_api::read_fast_art_root(root).unwrap_or(obj),
                 Err(_) => {
                     FAST_NEW_FAILED.fetch_add(1, Ordering::Relaxed);
                     0
@@ -1006,7 +1002,7 @@ unsafe fn build_raw_value_args<'a>(
 #[inline]
 unsafe fn root_fast_hook_entry_refs(ctx: &hook_ffi::HookContext, rule: &FastRule) {
     if !rule.is_static && ctx.x[1] != 0 {
-        let _ = crate::jsapi::java::java_lua_fast_api::root_lua_fast_raw_object_for_callback(ctx.x[1]);
+        let _ = crate::jsapi::java::java_fast_api::root_fast_raw_object_for_callback(ctx.x[1]);
     }
     for (idx, is_object) in rule.object_params.iter().enumerate() {
         if !*is_object {
@@ -1014,7 +1010,7 @@ unsafe fn root_fast_hook_entry_refs(ctx: &hook_ffi::HookContext, rule: &FastRule
         }
         let raw = read_arg(ctx, rule, idx);
         if raw != 0 {
-            let _ = crate::jsapi::java::java_lua_fast_api::root_lua_fast_raw_object_for_callback(raw);
+            let _ = crate::jsapi::java::java_fast_api::root_fast_raw_object_for_callback(raw);
         }
     }
 }
@@ -1142,7 +1138,7 @@ pub unsafe extern "C" fn fast_hook_dispatch_from_quick(
     };
 
     if rule.needs_art_handle_scope {
-        crate::jsapi::java::java_lua_fast_api::with_lua_fast_art_handle_scope((*ctx_ptr).x[19], || {
+        crate::jsapi::java::java_fast_api::with_fast_art_handle_scope((*ctx_ptr).x[19], || {
             let ctx = &*ctx_ptr;
             root_fast_hook_entry_refs(ctx, rule);
             run_fast_rule_body(ctx_ptr, rule);
@@ -1202,7 +1198,7 @@ pub(crate) struct FastStats {
 
 pub(crate) fn fast_stats() -> FastStats {
     let (new_tlab_hit, new_tlab_miss, new_slow_path) =
-        unsafe { crate::jsapi::java::java_lua_fast_api::fast_tlab_alloc_stats() };
+        unsafe { crate::jsapi::java::java_fast_api::fast_tlab_alloc_stats() };
     FastStats {
         total: FAST_CALLBACK_TOTAL.load(Ordering::Acquire),
         matched: FAST_CALLBACK_MATCHED.load(Ordering::Acquire),

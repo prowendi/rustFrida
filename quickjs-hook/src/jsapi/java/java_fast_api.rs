@@ -1,4 +1,4 @@
-//! Java.luaFastMethod() backend used by Lua high-frequency callbacks.
+//! Java.fastMethod() backend used by fast callbacks.
 //!
 //! This is intentionally fast-only: registration rejects methods that do not
 //! currently have an independent quick-code entrypoint. Slow/reflection/JNI
@@ -22,29 +22,28 @@ use super::reflect::{decode_field_id, decode_method_id, find_class_safe};
 use super::safe_mem::{refresh_mem_regions, safe_read_u32};
 
 #[derive(Clone, Debug)]
-pub(crate) struct LuaFastMethod {
+pub(crate) struct FastMethod {
     pub(crate) art_method: u64,
-    method_id: u64,
+    #[allow(dead_code)]
     class_global_ref: u64,
     class_mirror: u64,
     pub(crate) is_static: bool,
-    pub(crate) return_type: u8,
     pub(crate) param_types: Vec<String>,
     shorty: CString,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct LuaFastConstructor {
+pub(crate) struct FastConstructor {
+    #[allow(dead_code)]
     pub(crate) class_global_ref: u64,
     pub(crate) class_mirror: u64,
     pub(crate) art_method: u64,
-    method_id: u64,
     pub(crate) param_types: Vec<String>,
     shorty: CString,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct LuaFastField {
+pub(crate) struct FastField {
     #[allow(dead_code)]
     pub(crate) art_field: u64,
     pub(crate) offset: u32,
@@ -58,15 +57,9 @@ pub(crate) struct LuaFastField {
     pub(crate) field_name: String,
 }
 
-#[derive(Clone, Copy)]
-pub(crate) enum LuaFastArg {
-    Raw(u64),
-    JniRef { env: JniEnv, object: *mut std::ffi::c_void },
-}
-
-static LUA_FAST_METHODS: OnceLock<Mutex<Vec<LuaFastMethod>>> = OnceLock::new();
-static LUA_FAST_CONSTRUCTORS: OnceLock<Mutex<Vec<LuaFastConstructor>>> = OnceLock::new();
-static LUA_FAST_FIELDS: OnceLock<Mutex<Vec<LuaFastField>>> = OnceLock::new();
+static FAST_METHODS: OnceLock<Mutex<Vec<FastMethod>>> = OnceLock::new();
+static FAST_CONSTRUCTORS: OnceLock<Mutex<Vec<FastConstructor>>> = OnceLock::new();
+static FAST_FIELDS: OnceLock<Mutex<Vec<FastField>>> = OnceLock::new();
 static FAST_ART_EXCEPTION_SEEN: AtomicU64 = AtomicU64::new(0);
 static FAST_ART_EXCEPTION_CLEARED: AtomicU64 = AtomicU64::new(0);
 static FAST_ART_HANDLE_SCOPE_ENTER: AtomicU64 = AtomicU64::new(0);
@@ -79,10 +72,13 @@ static QUICK_ENTRYPOINTS_OFFSET: AtomicUsize = AtomicUsize::new(0);
 static FAST_TLAB_ALLOC_HIT: AtomicU64 = AtomicU64::new(0);
 static FAST_TLAB_ALLOC_MISS: AtomicU64 = AtomicU64::new(0);
 static FAST_QUICK_ALLOC_SLOW_PATH: AtomicU64 = AtomicU64::new(0);
+static ART_CALLEE_SAVE_SUSPEND_METHOD: OnceLock<u64> = OnceLock::new();
+static ART_QUICK_TEST_SUSPEND_ENTRYPOINT: OnceLock<u64> = OnceLock::new();
 
 const QUICK_ENTRYPOINTS_OFFSET_FAILED: usize = usize::MAX;
 const QUICK_ENTRYPOINT_COUNT: usize = 174;
 const QUICK_ALLOC_OBJECT_INITIALIZED_INDEX: usize = 6;
+const QUICK_TEST_SUSPEND_INDEX: usize = 105;
 const QUICK_JNI_METHOD_START_INDEX: usize = 45;
 const QUICK_JNI_METHOD_END_INDEX: usize = 46;
 const QUICK_SCAN_LIMIT: usize = 16384;
@@ -128,7 +124,7 @@ fn update_fast_max(target: &AtomicU64, value: u64) {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct LuaFastArtRoot {
+pub(crate) struct FastArtRoot {
     slot: u32,
 }
 
@@ -184,16 +180,145 @@ pub(crate) struct CompileResult {
     pub(crate) message: String,
 }
 
-fn lua_fast_methods() -> &'static Mutex<Vec<LuaFastMethod>> {
-    LUA_FAST_METHODS.get_or_init(|| Mutex::new(Vec::new()))
+#[no_mangle]
+pub unsafe extern "C" fn art_quick_callee_save_suspend_method() -> *mut std::ffi::c_void {
+    *ART_CALLEE_SAVE_SUSPEND_METHOD.get_or_init(|| unsafe { resolve_callee_save_suspend_method().unwrap_or(0) })
+        as *mut std::ffi::c_void
 }
 
-fn lua_fast_constructors() -> &'static Mutex<Vec<LuaFastConstructor>> {
-    LUA_FAST_CONSTRUCTORS.get_or_init(|| Mutex::new(Vec::new()))
+#[no_mangle]
+pub unsafe extern "C" fn art_quick_test_suspend_entrypoint() -> *mut std::ffi::c_void {
+    *ART_QUICK_TEST_SUSPEND_ENTRYPOINT.get_or_init(|| unsafe {
+        let env = get_thread_env().unwrap_or(std::ptr::null_mut());
+        current_art_thread(env)
+            .and_then(|thread| quick_entrypoint(thread as usize, QUICK_TEST_SUSPEND_INDEX))
+            .unwrap_or(0)
+    }) as *mut std::ffi::c_void
 }
 
-fn lua_fast_fields() -> &'static Mutex<Vec<LuaFastField>> {
-    LUA_FAST_FIELDS.get_or_init(|| Mutex::new(Vec::new()))
+#[no_mangle]
+pub unsafe extern "C" fn art_quick_top_quick_frame_offset() -> u64 {
+    super::art_controller::cached_thread_top_quick_frame_offset()
+        .map(|v| v as u64)
+        .unwrap_or(u64::MAX)
+}
+
+unsafe fn resolve_callee_save_suspend_method() -> Option<u64> {
+    const CALLEE_SAVE_EVERYTHING_FOR_SUSPEND_CHECK: u32 = 5;
+    let runtime = resolve_art_runtime_instance()?;
+
+    type GetCalleeSaveMethodFn = unsafe extern "C" fn(*mut std::ffi::c_void, u32) -> *mut std::ffi::c_void;
+    for sym_name in [
+        "_ZN3art7Runtime19GetCalleeSaveMethodENS_14CalleeSaveTypeE",
+        "_ZN3art7Runtime28GetCalleeSaveMethodUncheckedENS_14CalleeSaveTypeE",
+    ] {
+        let sym = crate::jsapi::module::libart_dlsym(sym_name);
+        if sym.is_null() {
+            continue;
+        }
+        let get_method: GetCalleeSaveMethodFn = std::mem::transmute(sym);
+        let method = get_method(runtime, CALLEE_SAVE_EVERYTHING_FOR_SUSPEND_CHECK);
+        if !method.is_null() {
+            crate::jsapi::console::output_message(&format!(
+                "[fast] ART callee-save suspend method via {}: {:?}",
+                sym_name, method
+            ));
+            return Some(method as u64);
+        }
+    }
+
+    if let Some(method) = resolve_callee_save_suspend_method_from_quick_stub(runtime) {
+        return Some(method);
+    }
+
+    crate::jsapi::console::output_message("[fast] ART callee-save suspend method unavailable");
+    None
+}
+
+unsafe fn resolve_callee_save_suspend_method_from_quick_stub(runtime: *mut std::ffi::c_void) -> Option<u64> {
+    let mut entry = crate::jsapi::module::libart_dlsym("art_quick_test_suspend") as u64;
+    if entry == 0 {
+        let env = get_thread_env().unwrap_or(std::ptr::null_mut());
+        entry =
+            current_art_thread(env).and_then(|thread| quick_entrypoint(thread as usize, QUICK_TEST_SUSPEND_INDEX))?;
+    }
+
+    let runtime_addr = runtime as u64;
+    for i in 0..192usize {
+        let insn = std::ptr::read_unaligned((entry as usize + i * 4) as *const u32);
+        if (insn & 0xffc0_0000) != 0xf940_0000 {
+            continue;
+        }
+        let rt = insn & 0x1f;
+        let rn = (insn >> 5) & 0x1f;
+        if rt != rn {
+            continue;
+        }
+        let offset = (((insn >> 10) & 0xfff) as u64) * 8;
+        if offset < 5 * 8 || offset > 0x8000 {
+            continue;
+        }
+        let method = std::ptr::read_volatile((runtime_addr + offset) as *const u64) & 0x00ff_ffff_ffff_ffff;
+        if method == 0 || !looks_like_callee_save_method_array(runtime_addr, offset) {
+            continue;
+        }
+        crate::jsapi::console::output_message(&format!(
+            "[fast] ART callee-save suspend method from art_quick_test_suspend: method={:#x}, runtime_off=0x{:x}, stub={:#x}",
+            method, offset, entry
+        ));
+        return Some(method);
+    }
+    None
+}
+
+unsafe fn looks_like_callee_save_method_array(runtime: u64, suspend_method_offset: u64) -> bool {
+    let first = runtime + suspend_method_offset - 5 * 8;
+    let mut previous = 0u64;
+    for i in 0..6u64 {
+        let method = std::ptr::read_volatile((first + i * 8) as *const u64) & 0x00ff_ffff_ffff_ffff;
+        if method == 0 || (method & 0x3) != 0 {
+            return false;
+        }
+        if previous != 0 && method == previous {
+            return false;
+        }
+        previous = method;
+    }
+    true
+}
+
+unsafe fn resolve_art_runtime_instance() -> Option<*mut std::ffi::c_void> {
+    let instance_ptr = crate::jsapi::module::libart_dlsym("_ZN3art7Runtime9instance_E");
+    if !instance_ptr.is_null() {
+        let raw = std::ptr::read_volatile(instance_ptr as *const u64) & 0x00ff_ffff_ffff_ffff;
+        if raw != 0 {
+            return Some(raw as *mut std::ffi::c_void);
+        }
+    }
+
+    let current_sym = crate::jsapi::module::libart_dlsym("_ZN3art7Runtime7CurrentEv");
+    if !current_sym.is_null() {
+        let current: unsafe extern "C" fn() -> *mut std::ffi::c_void = std::mem::transmute(current_sym);
+        let runtime = current();
+        if !runtime.is_null() {
+            return Some(runtime);
+        }
+    }
+
+    crate::jsapi::console::output_message("[fast] ART Runtime::instance_ unavailable");
+    None
+}
+
+fn fast_methods() -> &'static Mutex<Vec<FastMethod>> {
+    FAST_METHODS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn fast_constructors() -> &'static Mutex<Vec<FastConstructor>> {
+    FAST_CONSTRUCTORS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn fast_fields() -> &'static Mutex<Vec<FastField>> {
+    FAST_FIELDS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 fn make_shorty(sig: &str) -> CString {
@@ -217,7 +342,7 @@ fn shorty_char(type_sig: &str) -> u8 {
     }
 }
 
-unsafe fn resolve_lua_fast_method(
+unsafe fn resolve_fast_method(
     env: JniEnv,
     class_name: &str,
     method_name: &str,
@@ -266,38 +391,38 @@ unsafe fn resolve_lua_fast_method(
     Err(format!("method not found: {}.{}{}", class_name, method_name, signature))
 }
 
-pub(crate) fn get_lua_fast_method(handle: u64) -> Option<LuaFastMethod> {
+pub(crate) fn get_fast_method(handle: u64) -> Option<FastMethod> {
     if handle == 0 {
         return None;
     }
-    let methods = lua_fast_methods().lock().unwrap_or_else(|e| e.into_inner());
+    let methods = fast_methods().lock().unwrap_or_else(|e| e.into_inner());
     methods.get((handle - 1) as usize).cloned()
 }
 
-pub(crate) fn get_lua_fast_constructor(handle: u64) -> Option<LuaFastConstructor> {
+pub(crate) fn get_fast_constructor(handle: u64) -> Option<FastConstructor> {
     if handle == 0 {
         return None;
     }
-    let constructors = lua_fast_constructors().lock().unwrap_or_else(|e| e.into_inner());
+    let constructors = fast_constructors().lock().unwrap_or_else(|e| e.into_inner());
     constructors.get((handle - 1) as usize).cloned()
 }
 
-pub(crate) fn get_lua_fast_field(handle: u64) -> Option<LuaFastField> {
+pub(crate) fn get_fast_field(handle: u64) -> Option<FastField> {
     if handle == 0 {
         return None;
     }
-    let fields = lua_fast_fields().lock().unwrap_or_else(|e| e.into_inner());
+    let fields = fast_fields().lock().unwrap_or_else(|e| e.into_inner());
     fields.get((handle - 1) as usize).cloned()
 }
 
-unsafe fn is_lua_fast_field_type(sig: &str) -> bool {
+unsafe fn is_fast_field_type(sig: &str) -> bool {
     matches!(
         sig.as_bytes().first().copied(),
         Some(b'Z' | b'B' | b'C' | b'S' | b'I' | b'J' | b'F' | b'D' | b'L' | b'[')
     )
 }
 
-unsafe fn parse_lua_fast_options(
+unsafe fn parse_fast_options(
     ctx: *mut ffi::JSContext,
     argc: i32,
     argv: *mut ffi::JSValue,
@@ -341,7 +466,7 @@ unsafe fn parse_lua_fast_options(
     Ok((false, RequestedCompileKind::Auto))
 }
 
-pub(crate) unsafe extern "C" fn js_java_lua_fast_method(
+pub(crate) unsafe extern "C" fn js_java_fast_method(
     ctx: *mut ffi::JSContext,
     _this: ffi::JSValue,
     argc: i32,
@@ -350,7 +475,7 @@ pub(crate) unsafe extern "C" fn js_java_lua_fast_method(
     if argc < 3 {
         return throw_type_error(
             ctx,
-            b"luaFastMethod(class, method, sig[, options]) requires at least 3 arguments\0",
+            b"fastMethod(class, method, sig[, options]) requires at least 3 arguments\0",
         );
     }
 
@@ -377,13 +502,13 @@ pub(crate) unsafe extern "C" fn js_java_lua_fast_method(
         Err(msg) => return throw_internal_error(ctx, msg),
     };
 
-    let (art_method, method_id, class_global_ref, is_static) =
-        match resolve_lua_fast_method(env, &class_name, &method_name, &actual_sig, force_static) {
+    let (art_method, _method_id, class_global_ref, is_static) =
+        match resolve_fast_method(env, &class_name, &method_name, &actual_sig, force_static) {
             Ok(v) => v,
             Err(msg) => return throw_internal_error(ctx, msg),
         };
 
-    let (should_compile, compile_kind) = match parse_lua_fast_options(ctx, argc, argv, 3) {
+    let (should_compile, compile_kind) = match parse_fast_options(ctx, argc, argv, 3) {
         Ok(v) => v,
         Err(e) => return e,
     };
@@ -395,7 +520,7 @@ pub(crate) unsafe extern "C" fn js_java_lua_fast_method(
         let compile = compile_art_method_to_quick(env, art_method, spec.entry_point_offset, bridge, compile_kind);
         entry_point = compile.after;
         crate::jsapi::console::output_verbose(&format!(
-            "[luaFastMethod] compile {}.{}{} kind={} success={} before={:#x} after={:#x} msg={}",
+            "[fastMethod] compile {}.{}{} kind={} success={} before={:#x} after={:#x} msg={}",
             class_name,
             method_name,
             actual_sig,
@@ -410,28 +535,26 @@ pub(crate) unsafe extern "C" fn js_java_lua_fast_method(
         return throw_internal_error(
             ctx,
             format!(
-                "luaFastMethod rejected {}.{}{}: no independent quick entrypoint (entry={:#x})",
+                "fastMethod rejected {}.{}{}: no independent quick entrypoint (entry={:#x})",
                 class_name, method_name, actual_sig, entry_point
             ),
         );
     }
 
-    let method = LuaFastMethod {
+    let method = FastMethod {
         art_method,
-        method_id,
         class_global_ref,
         class_mirror: super::decode_global_jobject_raw(env, class_global_ref as *mut std::ffi::c_void).unwrap_or(0),
         is_static,
-        return_type: get_return_type_from_sig(&actual_sig),
         param_types: parse_jni_param_types(&actual_sig),
         shorty: make_shorty(&actual_sig),
     };
-    let mut methods = lua_fast_methods().lock().unwrap_or_else(|e| e.into_inner());
+    let mut methods = fast_methods().lock().unwrap_or_else(|e| e.into_inner());
     methods.push(method);
     js_u64_to_js_number_or_bigint(ctx, methods.len() as u64)
 }
 
-pub(crate) unsafe extern "C" fn js_java_lua_fast_constructor(
+pub(crate) unsafe extern "C" fn js_java_fast_constructor(
     ctx: *mut ffi::JSContext,
     _this: ffi::JSValue,
     argc: i32,
@@ -440,7 +563,7 @@ pub(crate) unsafe extern "C" fn js_java_lua_fast_constructor(
     if argc < 2 {
         return throw_type_error(
             ctx,
-            b"luaFastConstructor(class, sig[, options]) requires at least 2 arguments\0",
+            b"fastConstructor(class, sig[, options]) requires at least 2 arguments\0",
         );
     }
 
@@ -461,8 +584,8 @@ pub(crate) unsafe extern "C" fn js_java_lua_fast_constructor(
         Err(msg) => return throw_internal_error(ctx, msg),
     };
 
-    let (art_method, method_id, class_global_ref, is_static) =
-        match resolve_lua_fast_method(env, &class_name, "<init>", &sig_str, false) {
+    let (art_method, _method_id, class_global_ref, is_static) =
+        match resolve_fast_method(env, &class_name, "<init>", &sig_str, false) {
             Ok(v) => v,
             Err(msg) => return throw_internal_error(ctx, msg),
         };
@@ -473,7 +596,7 @@ pub(crate) unsafe extern "C" fn js_java_lua_fast_constructor(
         );
     }
 
-    let (should_compile, compile_kind) = match parse_lua_fast_options(ctx, argc, argv, 2) {
+    let (should_compile, compile_kind) = match parse_fast_options(ctx, argc, argv, 2) {
         Ok(v) => v,
         Err(e) => return e,
     };
@@ -485,7 +608,7 @@ pub(crate) unsafe extern "C" fn js_java_lua_fast_constructor(
         let compile = compile_art_method_to_quick(env, art_method, spec.entry_point_offset, bridge, compile_kind);
         entry_point = compile.after;
         crate::jsapi::console::output_verbose(&format!(
-            "[luaFastConstructor] compile {}.<init>{} kind={} success={} before={:#x} after={:#x} msg={}",
+            "[fastConstructor] compile {}.<init>{} kind={} success={} before={:#x} after={:#x} msg={}",
             class_name, sig_str, compile.kind, compile.success, compile.before, compile.after, compile.message
         ));
     }
@@ -493,7 +616,7 @@ pub(crate) unsafe extern "C" fn js_java_lua_fast_constructor(
         return throw_internal_error(
             ctx,
             format!(
-                "luaFastConstructor rejected {}.<init>{}: no independent quick entrypoint (entry={:#x})",
+                "fastConstructor rejected {}.<init>{}: no independent quick entrypoint (entry={:#x})",
                 class_name, sig_str, entry_point
             ),
         );
@@ -501,33 +624,29 @@ pub(crate) unsafe extern "C" fn js_java_lua_fast_constructor(
 
     let class_mirror = super::decode_global_jobject_raw(env, class_global_ref as *mut std::ffi::c_void).unwrap_or(0);
     output_verbose(&format!(
-        "[lua fast ctor] {}.<init>{} class_global={:#x} class_mirror={:#x}",
+        "[fastConstructor] {}.<init>{} class_global={:#x} class_mirror={:#x}",
         class_name, sig_str, class_global_ref as usize, class_mirror
     ));
-    let constructor = LuaFastConstructor {
+    let constructor = FastConstructor {
         class_global_ref: class_global_ref as u64,
         class_mirror,
         art_method,
-        method_id,
         param_types: parse_jni_param_types(&sig_str),
         shorty: make_shorty(&sig_str),
     };
-    let mut constructors = lua_fast_constructors().lock().unwrap_or_else(|e| e.into_inner());
+    let mut constructors = fast_constructors().lock().unwrap_or_else(|e| e.into_inner());
     constructors.push(constructor);
     js_u64_to_js_number_or_bigint(ctx, constructors.len() as u64)
 }
 
-pub(crate) unsafe extern "C" fn js_java_lua_fast_field(
+pub(crate) unsafe extern "C" fn js_java_fast_field(
     ctx: *mut ffi::JSContext,
     _this: ffi::JSValue,
     argc: i32,
     argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
     if argc < 2 {
-        return throw_type_error(
-            ctx,
-            b"luaFastField(class, field[, sig]) requires at least 2 arguments\0",
-        );
+        return throw_type_error(ctx, b"fastField(class, field[, sig]) requires at least 2 arguments\0");
     }
 
     let class_name = match extract_string_arg(ctx, JSValue(*argv), b"arg 0 must be string\0") {
@@ -581,10 +700,10 @@ pub(crate) unsafe extern "C" fn js_java_lua_fast_field(
         }
     }
     if is_static {
-        return throw_type_error(ctx, b"luaFastField only supports instance fields\0");
+        return throw_type_error(ctx, b"fastField only supports instance fields\0");
     }
-    if !is_lua_fast_field_type(&jni_sig) {
-        return throw_type_error(ctx, b"luaFastField only supports primitive/object instance fields\0");
+    if !is_fast_field_type(&jni_sig) {
+        return throw_type_error(ctx, b"fastField only supports primitive/object instance fields\0");
     }
 
     let cls = find_class_safe(env, &class_name);
@@ -602,7 +721,7 @@ pub(crate) unsafe extern "C" fn js_java_lua_fast_field(
         return throw_internal_error(ctx, format!("invalid field offset: {}.{}", class_name, field_name));
     }
 
-    let field = LuaFastField {
+    let field = FastField {
         art_field,
         offset,
         is_static,
@@ -611,7 +730,7 @@ pub(crate) unsafe extern "C" fn js_java_lua_fast_field(
         class_name,
         field_name,
     };
-    let mut fields = lua_fast_fields().lock().unwrap_or_else(|e| e.into_inner());
+    let mut fields = fast_fields().lock().unwrap_or_else(|e| e.into_inner());
     fields.push(field);
     js_u64_to_js_number_or_bigint(ctx, fields.len() as u64)
 }
@@ -839,115 +958,8 @@ type ArtMethodInvokeFn = unsafe extern "C" fn(
 
 static ART_METHOD_INVOKE: OnceLock<Option<ArtMethodInvokeFn>> = OnceLock::new();
 
-pub(crate) unsafe fn invoke_lua_fast_method(
-    method: &LuaFastMethod,
-    receiver: u64,
-    args: &[LuaFastArg],
-) -> Result<u64, String> {
-    if !method.is_static && receiver == 0 {
-        return Err("jcall instance receiver is null".to_string());
-    }
-    if args.len() != method.param_types.len() {
-        return Err(format!(
-            "jcall argument count mismatch: expected {}, got {}",
-            method.param_types.len(),
-            args.len()
-        ));
-    }
-
-    let env = get_thread_env().unwrap_or(std::ptr::null_mut());
-    if env.is_null() {
-        return Err("current JNIEnv is null".to_string());
-    }
-    let mut local_refs = Vec::new();
-    let receiver_obj = if method.is_static {
-        std::ptr::null_mut()
-    } else {
-        let local = raw_mirror_to_local_ref(env, receiver as *mut std::ffi::c_void);
-        if local.is_null() {
-            return Err("failed to create receiver local ref".to_string());
-        }
-        local_refs.push(local);
-        local
-    };
-
-    let mut jni_args = Vec::with_capacity(method.param_types.len());
-    for (i, type_sig) in method.param_types.iter().enumerate() {
-        jni_args.push(lua_fast_arg_to_jni_value(
-            env,
-            args[i],
-            type_sig.as_str(),
-            &mut local_refs,
-        )?);
-    }
-
-    let ret = call_lua_fast_jni_method(env, method, receiver_obj, &jni_args);
-    delete_local_refs(env, local_refs);
-    ret
-}
-
-#[allow(dead_code)]
-unsafe fn invoke_lua_fast_method_art(
-    method: &LuaFastMethod,
-    receiver: u64,
-    args: &[LuaFastArg],
-) -> Result<u64, String> {
-    let mut invoke_args = Vec::with_capacity(1 + method.param_types.len() * 2);
-    if !method.is_static {
-        push_art_invoke_arg(&mut invoke_args, "L", receiver);
-    }
-
-    for (i, type_sig) in method.param_types.iter().enumerate() {
-        let raw = resolve_lua_fast_arg(args[i], type_sig.as_str())?;
-        push_art_invoke_arg(&mut invoke_args, type_sig.as_str(), raw);
-    }
-
-    let Some(ret) = crate::lua::callback::with_current_quick_runnable(|thread| {
-        invoke_lua_fast_method_art_ready(method, thread as u64, &mut invoke_args)
-    }) else {
-        return Err("jcall is only available inside quick Lua callbacks".to_string());
-    };
-    ret
-}
-
-pub(crate) unsafe fn invoke_lua_fast_method_art_on_thread(
-    method: &LuaFastMethod,
-    thread: u64,
-    receiver: u64,
-    args: &[LuaFastArg],
-) -> Result<u64, String> {
-    if thread == 0 {
-        return Err("current ART Thread is null".to_string());
-    }
-    if !method.is_static && receiver == 0 {
-        return Err("jcall instance receiver is null".to_string());
-    }
-    if args.len() != method.param_types.len() {
-        return Err(format!(
-            "jcall argument count mismatch: expected {}, got {}",
-            method.param_types.len(),
-            args.len()
-        ));
-    }
-
-    let mut invoke_args = Vec::with_capacity(1 + method.param_types.len() * 2);
-    if !method.is_static {
-        push_art_invoke_arg(&mut invoke_args, "L", receiver);
-    }
-    for (i, type_sig) in method.param_types.iter().enumerate() {
-        let raw = resolve_lua_fast_arg(args[i], type_sig.as_str())?;
-        push_art_invoke_arg(&mut invoke_args, type_sig.as_str(), raw);
-    }
-    let before_exception = thread_exception(thread);
-    let ret = invoke_lua_fast_method_art_ready(method, thread, &mut invoke_args)?;
-    if clear_new_thread_exception(thread, before_exception) {
-        return Err("ArtMethod::Invoke method raised exception".to_string());
-    }
-    Ok(ret)
-}
-
-pub(crate) unsafe fn invoke_lua_fast_method_raw_on_thread(
-    method: &LuaFastMethod,
+pub(crate) unsafe fn invoke_fast_method_raw_on_thread(
+    method: &FastMethod,
     thread: u64,
     receiver: u64,
     args: &[u64],
@@ -974,14 +986,14 @@ pub(crate) unsafe fn invoke_lua_fast_method_raw_on_thread(
         invoke_args.push(type_sig.as_str(), args[i])?;
     }
     let before_exception = thread_exception(thread);
-    let ret = invoke_lua_fast_method_art_ready_raw(method, thread, invoke_args.as_mut_ptr(), invoke_args.size_bytes())?;
+    let ret = invoke_fast_method_art_ready_raw(method, thread, invoke_args.as_mut_ptr(), invoke_args.size_bytes())?;
     if clear_new_thread_exception(thread, before_exception) {
         return Err("ArtMethod::Invoke method raised exception".to_string());
     }
     Ok(ret)
 }
 
-pub(crate) unsafe fn lua_fast_method_receiver_is_exact(method: &LuaFastMethod, receiver: u64) -> bool {
+pub(crate) unsafe fn fast_method_receiver_is_exact(method: &FastMethod, receiver: u64) -> bool {
     method.is_static || object_class_matches(receiver, method.class_mirror)
 }
 
@@ -993,21 +1005,8 @@ unsafe fn object_class_matches(obj: u64, class_mirror: u64) -> bool {
     compressed_class == (class_mirror & 0xffff_ffff)
 }
 
-unsafe fn invoke_lua_fast_method_art_ready(
-    method: &LuaFastMethod,
-    thread: u64,
-    invoke_args: &mut Vec<u32>,
-) -> Result<u64, String> {
-    invoke_lua_fast_method_art_ready_raw(
-        method,
-        thread,
-        invoke_args.as_mut_ptr(),
-        (invoke_args.len() * std::mem::size_of::<u32>()) as u32,
-    )
-}
-
-unsafe fn invoke_lua_fast_method_art_ready_raw(
-    method: &LuaFastMethod,
+unsafe fn invoke_fast_method_art_ready_raw(
+    method: &FastMethod,
     thread: u64,
     args: *mut u32,
     args_size: u32,
@@ -1027,116 +1026,8 @@ unsafe fn invoke_lua_fast_method_art_ready_raw(
     Ok(result)
 }
 
-pub(crate) unsafe fn invoke_lua_fast_constructor(
-    ctor: &LuaFastConstructor,
-    receiver: u64,
-    args: &[LuaFastArg],
-) -> Result<(), String> {
-    if receiver == 0 {
-        return Err("jnew receiver allocation returned null".to_string());
-    }
-    if args.len() != ctor.param_types.len() {
-        return Err(format!(
-            "jnew argument count mismatch: expected {}, got {}",
-            ctor.param_types.len(),
-            args.len()
-        ));
-    }
-
-    if let Ok(()) = invoke_lua_fast_constructor_art(ctor, receiver, args) {
-        return Ok(());
-    }
-
-    let env = get_thread_env().unwrap_or(std::ptr::null_mut());
-    if env.is_null() {
-        return Err("current JNIEnv is null".to_string());
-    }
-    let mut local_refs = Vec::new();
-    let receiver_obj = raw_mirror_to_local_ref(env, receiver as *mut std::ffi::c_void);
-    if receiver_obj.is_null() {
-        return Err("failed to create constructor receiver local ref".to_string());
-    }
-    local_refs.push(receiver_obj);
-    let mut jni_args = Vec::with_capacity(ctor.param_types.len());
-    for (i, type_sig) in ctor.param_types.iter().enumerate() {
-        jni_args.push(lua_fast_arg_to_jni_value(
-            env,
-            args[i],
-            type_sig.as_str(),
-            &mut local_refs,
-        )?);
-    }
-
-    let ret = call_lua_fast_jni_constructor(env, ctor, receiver_obj, &jni_args);
-    delete_local_refs(env, local_refs);
-    ret
-}
-
-#[allow(dead_code)]
-unsafe fn invoke_lua_fast_constructor_art(
-    ctor: &LuaFastConstructor,
-    receiver: u64,
-    args: &[LuaFastArg],
-) -> Result<(), String> {
-    let mut invoke_args = Vec::with_capacity(1 + ctor.param_types.len() * 2);
-    push_art_invoke_arg(&mut invoke_args, "L", receiver);
-
-    for (i, type_sig) in ctor.param_types.iter().enumerate() {
-        let raw = resolve_lua_fast_arg(args[i], type_sig.as_str())?;
-        push_art_invoke_arg(&mut invoke_args, type_sig.as_str(), raw);
-    }
-
-    let Some(ret) = crate::lua::callback::with_current_quick_runnable(|thread| {
-        invoke_lua_fast_constructor_art_ready(ctor, thread as u64, &mut invoke_args)
-    }) else {
-        return Err("jnew is only available inside quick Lua callbacks".to_string());
-    };
-    ret?;
-
-    let env = get_thread_env().unwrap_or(std::ptr::null_mut());
-    if !env.is_null() && jni_check_exc(env) {
-        Err("ArtMethod::Invoke constructor raised exception".to_string())
-    } else {
-        Ok(())
-    }
-}
-
-pub(crate) unsafe fn invoke_lua_fast_constructor_art_on_thread(
-    ctor: &LuaFastConstructor,
-    thread: u64,
-    receiver: u64,
-    args: &[LuaFastArg],
-) -> Result<(), String> {
-    if thread == 0 {
-        return Err("current ART Thread is null".to_string());
-    }
-    if receiver == 0 {
-        return Err("jnew receiver allocation returned null".to_string());
-    }
-    if args.len() != ctor.param_types.len() {
-        return Err(format!(
-            "jnew argument count mismatch: expected {}, got {}",
-            ctor.param_types.len(),
-            args.len()
-        ));
-    }
-
-    let mut invoke_args = Vec::with_capacity(1 + ctor.param_types.len() * 2);
-    push_art_invoke_arg(&mut invoke_args, "L", receiver);
-    for (i, type_sig) in ctor.param_types.iter().enumerate() {
-        let raw = resolve_lua_fast_arg(args[i], type_sig.as_str())?;
-        push_art_invoke_arg(&mut invoke_args, type_sig.as_str(), raw);
-    }
-    let before_exception = thread_exception(thread);
-    invoke_lua_fast_constructor_art_ready(ctor, thread, &mut invoke_args)?;
-    if clear_new_thread_exception(thread, before_exception) {
-        return Err("ArtMethod::Invoke constructor raised exception".to_string());
-    }
-    Ok(())
-}
-
-pub(crate) unsafe fn invoke_lua_fast_constructor_raw_on_thread(
-    ctor: &LuaFastConstructor,
+pub(crate) unsafe fn invoke_fast_constructor_raw_on_thread(
+    ctor: &FastConstructor,
     thread: u64,
     receiver: u64,
     args: &[u64],
@@ -1161,28 +1052,15 @@ pub(crate) unsafe fn invoke_lua_fast_constructor_raw_on_thread(
         invoke_args.push(type_sig.as_str(), args[i])?;
     }
     let before_exception = thread_exception(thread);
-    invoke_lua_fast_constructor_art_ready_raw(ctor, thread, invoke_args.as_mut_ptr(), invoke_args.size_bytes())?;
+    invoke_fast_constructor_art_ready_raw(ctor, thread, invoke_args.as_mut_ptr(), invoke_args.size_bytes())?;
     if clear_new_thread_exception(thread, before_exception) {
         return Err("ArtMethod::Invoke constructor raised exception".to_string());
     }
     Ok(())
 }
 
-unsafe fn invoke_lua_fast_constructor_art_ready(
-    ctor: &LuaFastConstructor,
-    thread: u64,
-    invoke_args: &mut Vec<u32>,
-) -> Result<(), String> {
-    invoke_lua_fast_constructor_art_ready_raw(
-        ctor,
-        thread,
-        invoke_args.as_mut_ptr(),
-        (invoke_args.len() * std::mem::size_of::<u32>()) as u32,
-    )
-}
-
-unsafe fn invoke_lua_fast_constructor_art_ready_raw(
-    ctor: &LuaFastConstructor,
+unsafe fn invoke_fast_constructor_art_ready_raw(
+    ctor: &FastConstructor,
     thread: u64,
     args: *mut u32,
     args_size: u32,
@@ -1202,140 +1080,7 @@ unsafe fn invoke_lua_fast_constructor_art_ready_raw(
     Ok(())
 }
 
-unsafe fn lua_fast_arg_to_jni_value(
-    env: JniEnv,
-    arg: LuaFastArg,
-    type_sig: &str,
-    local_refs: &mut Vec<*mut std::ffi::c_void>,
-) -> Result<u64, String> {
-    if !matches!(type_sig.as_bytes().first().copied(), Some(b'L' | b'[')) {
-        return Ok(match arg {
-            LuaFastArg::Raw(raw) => raw,
-            LuaFastArg::JniRef { object, .. } => object as u64,
-        });
-    }
-
-    match arg {
-        LuaFastArg::Raw(0) => Ok(0),
-        LuaFastArg::Raw(raw) => {
-            let local = raw_mirror_to_local_ref(env, raw as *mut std::ffi::c_void);
-            if local.is_null() {
-                Err("failed to create object argument local ref".to_string())
-            } else {
-                local_refs.push(local);
-                Ok(local as u64)
-            }
-        }
-        LuaFastArg::JniRef { object, .. } => Ok(object as u64),
-    }
-}
-
-unsafe fn call_lua_fast_jni_method(
-    env: JniEnv,
-    method: &LuaFastMethod,
-    receiver: *mut std::ffi::c_void,
-    args: &[u64],
-) -> Result<u64, String> {
-    let cls = method.class_global_ref as *mut std::ffi::c_void;
-    let mid = method.method_id as *mut std::ffi::c_void;
-    let argv = args.as_ptr() as *const std::ffi::c_void;
-    let vtable = *(env as *const *const usize);
-
-    let result = match (method.is_static, method.return_type) {
-        (true, b'V') => {
-            type FnTy =
-                unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void, *const std::ffi::c_void);
-            let f: FnTy = std::mem::transmute(*vtable.add(JNI_CALL_STATIC_VOID_METHOD_A));
-            f(env, cls, mid, argv);
-            0
-        }
-        (false, b'V') => {
-            type FnTy =
-                unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void, *const std::ffi::c_void);
-            let f: FnTy = std::mem::transmute(*vtable.add(JNI_CALL_VOID_METHOD_A));
-            f(env, receiver, mid, argv);
-            0
-        }
-        (true, b'Z') => call_static_primitive_u8(env, cls, mid, argv, JNI_CALL_STATIC_BOOLEAN_METHOD_A) as u64,
-        (false, b'Z') => call_primitive_u8(env, receiver, mid, argv, JNI_CALL_BOOLEAN_METHOD_A) as u64,
-        (true, b'B') => call_static_primitive_i8(env, cls, mid, argv, JNI_CALL_STATIC_BYTE_METHOD_A) as u64,
-        (false, b'B') => call_primitive_i8(env, receiver, mid, argv, JNI_CALL_BYTE_METHOD_A) as u64,
-        (true, b'C') => call_static_primitive_u16(env, cls, mid, argv, JNI_CALL_STATIC_CHAR_METHOD_A) as u64,
-        (false, b'C') => call_primitive_u16(env, receiver, mid, argv, JNI_CALL_CHAR_METHOD_A) as u64,
-        (true, b'S') => call_static_primitive_i16(env, cls, mid, argv, JNI_CALL_STATIC_SHORT_METHOD_A) as u64,
-        (false, b'S') => call_primitive_i16(env, receiver, mid, argv, JNI_CALL_SHORT_METHOD_A) as u64,
-        (true, b'I') => call_static_primitive_i32(env, cls, mid, argv, JNI_CALL_STATIC_INT_METHOD_A) as u64,
-        (false, b'I') => call_primitive_i32(env, receiver, mid, argv, JNI_CALL_INT_METHOD_A) as u64,
-        (true, b'J') => call_static_primitive_i64(env, cls, mid, argv, JNI_CALL_STATIC_LONG_METHOD_A) as u64,
-        (false, b'J') => call_primitive_i64(env, receiver, mid, argv, JNI_CALL_LONG_METHOD_A) as u64,
-        (true, b'F') => call_static_primitive_f32(env, cls, mid, argv, JNI_CALL_STATIC_FLOAT_METHOD_A).to_bits() as u64,
-        (false, b'F') => call_primitive_f32(env, receiver, mid, argv, JNI_CALL_FLOAT_METHOD_A).to_bits() as u64,
-        (true, b'D') => call_static_primitive_f64(env, cls, mid, argv, JNI_CALL_STATIC_DOUBLE_METHOD_A).to_bits(),
-        (false, b'D') => call_primitive_f64(env, receiver, mid, argv, JNI_CALL_DOUBLE_METHOD_A).to_bits(),
-        (true, _) => call_static_object_method(env, cls, mid, argv)?,
-        (false, _) => call_object_method(env, receiver, mid, argv)?,
-    };
-    if jni_check_exc(env) {
-        Err("JNI method call raised exception".to_string())
-    } else {
-        Ok(result)
-    }
-}
-
-unsafe fn call_lua_fast_jni_constructor(
-    env: JniEnv,
-    ctor: &LuaFastConstructor,
-    receiver: *mut std::ffi::c_void,
-    args: &[u64],
-) -> Result<(), String> {
-    let mid = ctor.method_id as *mut std::ffi::c_void;
-    let argv = args.as_ptr() as *const std::ffi::c_void;
-    let vtable = *(env as *const *const usize);
-    type FnTy = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void, *const std::ffi::c_void);
-    let f: FnTy = std::mem::transmute(*vtable.add(JNI_CALL_VOID_METHOD_A));
-    f(env, receiver, mid, argv);
-    if jni_check_exc(env) {
-        Err("JNI constructor call raised exception".to_string())
-    } else {
-        Ok(())
-    }
-}
-
-unsafe fn call_object_method(
-    env: JniEnv,
-    obj: *mut std::ffi::c_void,
-    mid: *mut std::ffi::c_void,
-    args: *const std::ffi::c_void,
-) -> Result<u64, String> {
-    let f: CallObjectMethodAFn = jni_fn!(env, CallObjectMethodAFn, JNI_CALL_OBJECT_METHOD_A);
-    local_object_return_to_raw(env, f(env, obj, mid, args))
-}
-
-unsafe fn call_static_object_method(
-    env: JniEnv,
-    cls: *mut std::ffi::c_void,
-    mid: *mut std::ffi::c_void,
-    args: *const std::ffi::c_void,
-) -> Result<u64, String> {
-    let f: CallStaticObjectMethodAFn = jni_fn!(env, CallStaticObjectMethodAFn, JNI_CALL_STATIC_OBJECT_METHOD_A);
-    local_object_return_to_raw(env, f(env, cls, mid, args))
-}
-
-unsafe fn local_object_return_to_raw(env: JniEnv, obj: *mut std::ffi::c_void) -> Result<u64, String> {
-    if obj.is_null() {
-        return Ok(0);
-    }
-    let raw = super::decode_jobject_raw(env, obj)
-        .or_else(|| crate::lua::api::decode_jni_local_ref_via_irt(env as *const std::ffi::c_void, obj))
-        .ok_or_else(|| "failed to decode JNI object return".to_string())?;
-    if !crate::lua::api::push_current_local_ref(obj) {
-        delete_local_ref(env, obj);
-        return Err("callback local-ref scope unavailable".to_string());
-    }
-    Ok(raw)
-}
-
-pub(crate) unsafe fn with_lua_fast_art_handle_scope<R>(thread: u64, f: impl FnOnce() -> R) -> R {
+pub(crate) unsafe fn with_fast_art_handle_scope<R>(thread: u64, f: impl FnOnce() -> R) -> R {
     FAST_ART_HANDLE_SCOPE_ENTER.fetch_add(1, Ordering::Relaxed);
     let env = get_thread_env().unwrap_or(std::ptr::null_mut());
     if env.is_null() {
@@ -1378,7 +1123,7 @@ pub(crate) unsafe fn with_lua_fast_art_handle_scope<R>(thread: u64, f: impl FnOn
     result
 }
 
-pub(crate) unsafe fn root_lua_fast_raw_object_for_callback(raw: u64) -> Result<LuaFastArtRoot, String> {
+pub(crate) unsafe fn root_fast_raw_object_for_callback(raw: u64) -> Result<FastArtRoot, String> {
     if raw == 0 {
         return Err("cannot root null raw object".to_string());
     }
@@ -1400,11 +1145,11 @@ pub(crate) unsafe fn root_lua_fast_raw_object_for_callback(raw: u64) -> Result<L
         }
         scope.refs[slot] = raw as u32;
         scope.size += 1;
-        Ok(LuaFastArtRoot { slot: slot as u32 })
+        Ok(FastArtRoot { slot: slot as u32 })
     })
 }
 
-pub(crate) unsafe fn read_lua_fast_art_root(root: LuaFastArtRoot) -> Option<u64> {
+pub(crate) unsafe fn read_fast_art_root(root: FastArtRoot) -> Option<u64> {
     CURRENT_FAST_ART_HANDLE_SCOPE.with(|current| {
         let scope = current.get();
         if scope.is_null() {
@@ -1420,106 +1165,6 @@ pub(crate) unsafe fn read_lua_fast_art_root(root: LuaFastArtRoot) -> Option<u64>
     })
 }
 
-unsafe fn raw_mirror_to_local_ref(env: JniEnv, raw: *mut std::ffi::c_void) -> *mut std::ffi::c_void {
-    if env.is_null() || raw.is_null() {
-        return std::ptr::null_mut();
-    }
-    type ArtNewLocalRefFn = unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> *mut std::ffi::c_void;
-    static ART_NEW_LOCAL_REF: OnceLock<Option<ArtNewLocalRefFn>> = OnceLock::new();
-    let local = if let Some(add_ref) = *ART_NEW_LOCAL_REF.get_or_init(|| {
-        let sym = crate::jsapi::module::libart_dlsym("_ZN3art9JNIEnvExt11NewLocalRefEPNS_6mirror6ObjectE");
-        if sym.is_null() {
-            None
-        } else {
-            Some(std::mem::transmute(sym))
-        }
-    }) {
-        add_ref(env as *mut std::ffi::c_void, raw)
-    } else {
-        std::ptr::null_mut()
-    };
-    if jni_check_exc(env) {
-        std::ptr::null_mut()
-    } else {
-        local
-    }
-}
-
-unsafe fn delete_local_ref(env: JniEnv, obj: *mut std::ffi::c_void) {
-    if obj.is_null() {
-        return;
-    }
-    let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
-    delete_local_ref(env, obj);
-}
-
-unsafe fn delete_local_refs(env: JniEnv, refs: Vec<*mut std::ffi::c_void>) {
-    for obj in refs {
-        delete_local_ref(env, obj);
-    }
-}
-
-macro_rules! primitive_call {
-    ($name:ident, $ret:ty) => {
-        unsafe fn $name(
-            env: JniEnv,
-            obj: *mut std::ffi::c_void,
-            mid: *mut std::ffi::c_void,
-            args: *const std::ffi::c_void,
-            index: usize,
-        ) -> $ret {
-            type FnTy = unsafe extern "C" fn(
-                JniEnv,
-                *mut std::ffi::c_void,
-                *mut std::ffi::c_void,
-                *const std::ffi::c_void,
-            ) -> $ret;
-            let vtable = *(env as *const *const usize);
-            let f: FnTy = std::mem::transmute(*vtable.add(index));
-            f(env, obj, mid, args)
-        }
-    };
-}
-
-macro_rules! primitive_static_call {
-    ($name:ident, $ret:ty) => {
-        unsafe fn $name(
-            env: JniEnv,
-            cls: *mut std::ffi::c_void,
-            mid: *mut std::ffi::c_void,
-            args: *const std::ffi::c_void,
-            index: usize,
-        ) -> $ret {
-            type FnTy = unsafe extern "C" fn(
-                JniEnv,
-                *mut std::ffi::c_void,
-                *mut std::ffi::c_void,
-                *const std::ffi::c_void,
-            ) -> $ret;
-            let vtable = *(env as *const *const usize);
-            let f: FnTy = std::mem::transmute(*vtable.add(index));
-            f(env, cls, mid, args)
-        }
-    };
-}
-
-primitive_call!(call_primitive_u8, u8);
-primitive_call!(call_primitive_i8, i8);
-primitive_call!(call_primitive_u16, u16);
-primitive_call!(call_primitive_i16, i16);
-primitive_call!(call_primitive_i32, i32);
-primitive_call!(call_primitive_i64, i64);
-primitive_call!(call_primitive_f32, f32);
-primitive_call!(call_primitive_f64, f64);
-primitive_static_call!(call_static_primitive_u8, u8);
-primitive_static_call!(call_static_primitive_i8, i8);
-primitive_static_call!(call_static_primitive_u16, u16);
-primitive_static_call!(call_static_primitive_i16, i16);
-primitive_static_call!(call_static_primitive_i32, i32);
-primitive_static_call!(call_static_primitive_i64, i64);
-primitive_static_call!(call_static_primitive_f32, f32);
-primitive_static_call!(call_static_primitive_f64, f64);
-
 unsafe fn art_method_invoke() -> Option<ArtMethodInvokeFn> {
     *ART_METHOD_INVOKE.get_or_init(|| {
         let sym = crate::jsapi::module::libart_dlsym("_ZN3art9ArtMethod6InvokeEPNS_6ThreadEPjjPNS_6JValueEPKc");
@@ -1529,18 +1174,6 @@ unsafe fn art_method_invoke() -> Option<ArtMethodInvokeFn> {
             Some(std::mem::transmute(sym))
         }
     })
-}
-
-fn push_art_invoke_arg(out: &mut Vec<u32>, type_sig: &str, raw: u64) {
-    match type_sig.as_bytes().first().copied() {
-        Some(b'J' | b'D') => {
-            out.push(raw as u32);
-            out.push((raw >> 32) as u32);
-        }
-        Some(b'F') => out.push(raw as u32),
-        Some(b'L' | b'[') => out.push(raw as u32),
-        _ => out.push(raw as u32),
-    }
 }
 
 struct StackArtInvokeArgs {
@@ -1586,22 +1219,7 @@ impl StackArtInvokeArgs {
     }
 }
 
-unsafe fn resolve_lua_fast_arg(arg: LuaFastArg, type_sig: &str) -> Result<u64, String> {
-    match arg {
-        LuaFastArg::Raw(raw) => Ok(raw),
-        LuaFastArg::JniRef { env, object } => {
-            if !matches!(type_sig.as_bytes().first().copied(), Some(b'L' | b'[')) {
-                return Ok(object as u64);
-            }
-            super::decode_jobject_raw(env, object)
-                .or_else(|| crate::lua::api::decode_jni_local_ref_via_irt(env as *const std::ffi::c_void, object))
-                .or_else(|| super::decode_global_jobject_raw(env, object))
-                .ok_or_else(|| "failed to decode JNI ref for quick call".to_string())
-        }
-    }
-}
-
-pub(crate) unsafe fn alloc_lua_fast_object_quick_on_thread(thread: u64, class_mirror: u64) -> Option<u64> {
+pub(crate) unsafe fn alloc_fast_object_quick_on_thread(thread: u64, class_mirror: u64) -> Option<u64> {
     if thread == 0 || class_mirror == 0 {
         FAST_TLAB_ALLOC_MISS.fetch_add(1, Ordering::Relaxed);
         return None;
@@ -1618,11 +1236,11 @@ pub(crate) unsafe fn alloc_lua_fast_object_quick_on_thread(thread: u64, class_mi
     let end = std::ptr::read_volatile(end_addr);
     let Some(next) = pos.checked_add(object_size as u64) else {
         FAST_TLAB_ALLOC_MISS.fetch_add(1, Ordering::Relaxed);
-        return alloc_lua_fast_object_quick_slow_on_thread(thread, class_mirror);
+        return alloc_fast_object_quick_slow_on_thread(thread, class_mirror);
     };
     if pos == 0 || next > end {
         FAST_TLAB_ALLOC_MISS.fetch_add(1, Ordering::Relaxed);
-        return alloc_lua_fast_object_quick_slow_on_thread(thread, class_mirror);
+        return alloc_fast_object_quick_slow_on_thread(thread, class_mirror);
     }
     std::ptr::write_volatile(pos_addr, next);
     std::ptr::write_bytes(pos as *mut u8, 0, object_size as usize);
@@ -1636,7 +1254,7 @@ pub(crate) unsafe fn alloc_lua_fast_object_quick_on_thread(thread: u64, class_mi
     Some(pos)
 }
 
-unsafe fn alloc_lua_fast_object_quick_slow_on_thread(thread: u64, class_mirror: u64) -> Option<u64> {
+unsafe fn alloc_fast_object_quick_slow_on_thread(thread: u64, class_mirror: u64) -> Option<u64> {
     if thread == 0 || class_mirror == 0 {
         return None;
     }

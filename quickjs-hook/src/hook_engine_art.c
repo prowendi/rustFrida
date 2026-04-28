@@ -682,9 +682,9 @@ static void emit_art_router_inc_counter(Arm64Writer* w, volatile uint64_t* count
 /* C-callable stack check function (implemented in Rust art_controller.rs).
  * Returns 1 = normal routing, 0 = skip (callOriginal recursion). */
 extern int art_router_stack_check(uint64_t replacement);
-extern void* lua_quick_callee_save_suspend_method(void);
-extern void* lua_quick_test_suspend_entrypoint(void);
-extern uint64_t lua_quick_top_quick_frame_offset(void);
+extern void* art_quick_callee_save_suspend_method(void);
+extern void* art_quick_test_suspend_entrypoint(void);
+extern uint64_t art_quick_top_quick_frame_offset(void);
 
 static void emit_restore_args_only(Arm64Writer* w);
 static void emit_save_args_only(Arm64Writer* w);
@@ -701,7 +701,7 @@ static int resolve_art_quick_test_suspend_entrypoint(uint64_t* entrypoint_out) {
 
     if (!cached) {
         cached = 1;
-        cached_entrypoint = (uint64_t)lua_quick_test_suspend_entrypoint();
+        cached_entrypoint = (uint64_t)art_quick_test_suspend_entrypoint();
         g_art_router_quick_test_suspend_entrypoint = cached_entrypoint;
         hook_log("[art_router] quick test-suspend entrypoint: %p", (void*)cached_entrypoint);
     }
@@ -724,8 +724,8 @@ static int resolve_art_callee_save_frame_params(uint64_t* method_out, uint64_t* 
 
     if (!cached) {
         cached = 1;
-        cached_method = (uint64_t)lua_quick_callee_save_suspend_method();
-        cached_top_quick_off = lua_quick_top_quick_frame_offset();
+        cached_method = (uint64_t)art_quick_callee_save_suspend_method();
+        cached_top_quick_off = art_quick_top_quick_frame_offset();
         g_art_router_quick_callee_save_method = cached_method;
         g_art_router_quick_top_quick_frame_offset = cached_top_quick_off;
         hook_log("[art_router] quick callee-save params: method=%p top_quick_off=0x%llx",
@@ -879,7 +879,7 @@ static void emit_art_router_quick_callback_path(Arm64Writer* w, uint64_t lbl_qui
     arm64_writer_put_mov_reg_reg(w, ARM64_REG_X17, ARM64_REG_X21);
 
     /* Mode 2: call original first inside the router frame, then run the
-     * callback. Lua self:orig() reads the saved return value instead of
+     * callback. The callback reads the saved return value instead of
      * crossing JNI or calling quick code from a native callback stack. */
     arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_X20, 16);
     arm64_writer_put_mov_reg_imm(w, ARM64_REG_X1, 2);
@@ -974,9 +974,9 @@ static void emit_art_router_quick_callback_path(Arm64Writer* w, uint64_t lbl_qui
     emit_art_router_inc_counter(w, &g_art_router_quick_callback_count);
     arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_X20, 0);
     emit_restore_args_only(w);
-    /* Pre-orig object returns live only in the native HookContext until Lua
-     * asks for self:orig(). Publish the raw return in SaveEverything.x0 so a
-     * moving GC can update it while the Lua callback runs. The ArtMethod* for
+    /* Pre-orig object returns live only in the native HookContext until the
+     * callback consumes it. Publish the raw return in SaveEverything.x0 so a
+     * moving GC can update it while the callback runs. The ArtMethod* for
      * this frame is written directly at [sp], so x0 does not need to hold it. */
     arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_X22, QUICK_PREORIG_RET_REG * 8);
     emit_art_quick_test_suspend_poll(w);

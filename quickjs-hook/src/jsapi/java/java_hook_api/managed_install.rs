@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use super::super::art_controller::{ensure_art_controller_initialized, refresh_walkstack_sigsegv_guard};
 use super::super::art_method::*;
 use super::super::callback::*;
-use super::super::java_lua_fast_api::{compile_art_method_to_quick, RequestedCompileKind};
+use super::super::java_fast_api::{compile_art_method_to_quick, RequestedCompileKind};
 use super::super::jni_core::*;
 use super::super::reflect::{decode_method_id, find_class_safe, get_app_classloader_local_ref};
 use super::install_support::{create_class_global_ref, update_original_method_flags_for_hook, JavaHookInstallGuard};

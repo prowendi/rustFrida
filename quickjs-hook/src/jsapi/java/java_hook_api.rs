@@ -5,13 +5,11 @@
 mod fast_install;
 mod install;
 mod install_support;
-pub(crate) mod lua_install;
 mod managed_dex_builder;
 mod managed_install;
 mod uninstall;
 
 pub(super) use fast_install::{js_fast_hook, js_fast_hook_check, js_fast_hook_signature, js_fast_hook_stats};
 pub(super) use install::{js_java_hook, js_java_hook_quick};
-pub(super) use lua_install::js_lua_hook;
 pub(super) use managed_install::{js_managed_drain_messages, js_managed_hook_dsl, js_managed_read_counter};
 pub(super) use uninstall::js_java_unhook;
