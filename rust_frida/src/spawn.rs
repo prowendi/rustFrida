@@ -50,8 +50,8 @@ struct ZygotePatch {
     setargv0_slot: Option<(u64, [u8; 8])>,
     /// setcontext GOT slot（可选）
     setcontext_got: Option<(u64, [u8; 8])>,
-    /// prctl GOT slot（可选，用于保留 CAP_SYS_ADMIN）
-    prctl_got: Option<(u64, [u8; 8])>,
+    /// capset GOT slot（可选，用于属性 profile mount）
+    capset_got: Option<(u64, [u8; 8])>,
 }
 
 /// 全局状态
@@ -822,8 +822,8 @@ fn revert_child_patch_by_ppid(pid: u32, ppid: u32) -> Result<(), String> {
         mem.pwrite_all(backup, *addr)?;
     }
 
-    // 还原 prctl GOT（如果有）
-    if let Some((addr, backup)) = &patch.prctl_got {
+    // 还原 capset GOT（如果有）
+    if let Some((addr, backup)) = &patch.capset_got {
         log_verbose!("还原子进程 {} capset GOT at 0x{:x}", pid, addr);
         mem.pwrite_all(backup, *addr)?;
     }
@@ -1188,11 +1188,11 @@ fn inject_zymbiote(pid: u32, socket_name: &str) -> Result<ZygotePatch, String> {
 
     // 12. 属性伪装: 替换 capset GOT（仅指定 --profile 时）
     //     capset hook 在 cap drop 前执行 mount --bind
-    let prctl_got = if PROP_PROFILE_DIR.get().and_then(|v| v.as_ref()).is_some() {
+    let capset_got = if PROP_PROFILE_DIR.get().and_then(|v| v.as_ref()).is_some() {
         let got = find_got_entry_for_import(&maps, "libandroid_runtime.so", "capset");
         if let Some(got) = got {
             let backup = if already_patched {
-                libc_funcs.prctl.to_ne_bytes()
+                libc_funcs.capset.to_ne_bytes()
             } else {
                 let mut buf = [0u8; 8];
                 mem.pread_exact(&mut buf, got)?;
@@ -1222,7 +1222,7 @@ fn inject_zymbiote(pid: u32, socket_name: &str) -> Result<ZygotePatch, String> {
         payload_file_offset: loc.file_offset,
         setargv0_slot,
         setcontext_got,
-        prctl_got,
+        capset_got,
     })
 }
 
@@ -1363,7 +1363,7 @@ struct LibcFunctions {
     recv: u64,
     close: u64,
     raise: u64,
-    prctl: u64,
+    capset: u64,
 }
 
 /// 解析 libc.so 获取所需函数地址
@@ -1400,7 +1400,7 @@ fn resolve_libc_functions(maps: &[MapEntry]) -> Result<LibcFunctions, String> {
         recv: resolve("recv")?,
         close: resolve("close")?,
         raise: resolve("raise")?,
-        prctl: resolve("prctl")?,
+        capset: resolve("capset")?,
     })
 }
 
@@ -1912,10 +1912,10 @@ pub(crate) fn cleanup_zygote_patches() {
                     }
                 }
 
-                // 还原 prctl GOT
-                if let Some((addr, backup)) = &patch.prctl_got {
+                // 还原 capset GOT
+                if let Some((addr, backup)) = &patch.capset_got {
                     if let Err(e) = mem.pwrite_all(backup, *addr) {
-                        log_error!("还原 zygote {} prctl GOT 失败: {}", patch.pid, e);
+                        log_error!("还原 zygote {} capset GOT 失败: {}", patch.pid, e);
                     }
                 }
 

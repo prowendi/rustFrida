@@ -519,7 +519,12 @@ pub(crate) fn inject_via_bootstrapper(
     // 附加到目标进程
     attach_to_process(pid)?;
 
-    let page_size = 4096usize;
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size <= 0 || (page_size & (page_size - 1)) != 0 {
+        let _ = ptrace::detach(Pid::from_raw(pid), None);
+        return Err(format!("非法 page size: {}", page_size));
+    }
+    let page_size = page_size as usize;
     let code_size = BOOTSTRAPPER.len().max(FRIDA_LOADER.len());
     let code_pages = ((code_size + page_size - 1) / page_size) * page_size;
     let data_size = 4 * page_size;
