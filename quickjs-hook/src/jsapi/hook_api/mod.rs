@@ -116,12 +116,16 @@ pub(crate) unsafe fn free_hook_callback(data: &registry::HookData) {
 /// Phase 1 - 切断 native hook 入口 (hook() JS API 装的所有 hook，不释放 callback)。
 /// 注册表条目不 take，保留到 `free_native_hooks` 再批量释放 JS callback。
 pub fn cut_native_hooks() {
-    let guard = HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(registry) = guard.as_ref() {
-        for (addr, data) in registry.iter() {
-            unsafe {
-                remove_single_hook(*addr, data);
-            }
+    let hooks = {
+        let guard = HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .as_ref()
+            .map(|registry| registry.iter().map(|(addr, data)| (*addr, *data)).collect::<Vec<_>>())
+            .unwrap_or_default()
+    };
+    for (addr, data) in hooks {
+        unsafe {
+            remove_single_hook(addr, &data);
         }
     }
 }

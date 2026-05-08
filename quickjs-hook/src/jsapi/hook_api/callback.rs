@@ -92,6 +92,10 @@ fn current_native_hook_frame() -> Option<(*mut hook_ffi::HookContext, u64)> {
         .map(|frame| (frame.ctx_ptr as *mut hook_ffi::HookContext, frame.trampoline))
 }
 
+fn native_callback_would_reenter_js_engine() -> bool {
+    crate::JS_ENGINE_OWNER_THREAD.load(std::sync::atomic::Ordering::Acquire) == crate::current_thread_id_u64()
+}
+
 pub(crate) fn wait_for_in_flight_native_hook_callbacks(timeout: std::time::Duration) -> bool {
     let start = std::time::Instant::now();
     let mut in_flight = IN_FLIGHT_NATIVE_HOOK_CALLBACKS
@@ -189,6 +193,13 @@ pub(crate) unsafe extern "C" fn hook_callback_wrapper(
         };
         (hook_data.ctx, hook_data.callback_bytes, hook_data.trampoline)
     }; // HOOK_REGISTRY lock released here
+
+    if native_callback_would_reenter_js_engine() {
+        if trampoline != 0 {
+            (*ctx_ptr).x[0] = hook_ffi::hook_invoke_trampoline(ctx_ptr, trampoline as *mut std::ffi::c_void);
+        }
+        return;
+    }
 
     push_native_hook_frame(ctx_ptr, trampoline);
 
@@ -422,6 +433,9 @@ pub(crate) unsafe extern "C" fn attach_on_enter_wrapper(
     if ctx_ptr.is_null() || user_data.is_null() {
         return;
     }
+    if native_callback_would_reenter_js_engine() {
+        return;
+    }
     let _in_flight_guard = InFlightNativeHookGuard::enter();
 
     let target_addr = user_data as u64;
@@ -486,6 +500,9 @@ pub(crate) unsafe extern "C" fn attach_on_leave_wrapper(
     user_data: *mut std::ffi::c_void,
 ) {
     if ctx_ptr.is_null() || user_data.is_null() {
+        return;
+    }
+    if native_callback_would_reenter_js_engine() {
         return;
     }
     let _in_flight_guard = InFlightNativeHookGuard::enter();

@@ -70,6 +70,7 @@ pub(crate) enum HookKind {
 }
 
 /// Stored hook callback data - stores raw bytes to avoid Send/Sync issues
+#[derive(Clone, Copy)]
 pub(crate) struct HookData {
     pub(crate) ctx: usize,               // Store as usize to avoid Send/Sync issues
     pub(crate) callback_bytes: [u8; 16], // on_enter / replace callback (JSValue 16 字节)
